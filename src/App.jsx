@@ -253,7 +253,7 @@ function generatePlan(recipes, existingPlan, settings) {
     });
   });
 
-  const { ranges, excludes, redList } = settings;
+  const { ranges, excludes, redList, mealTargets } = settings;
   const now = Date.now();
   const eligible = recipes.filter(r => {
     if (r.quarantine) return false;
@@ -286,6 +286,9 @@ function generatePlan(recipes, existingPlan, settings) {
     }
   }));
 
+  // Recipe tag-score = sum of its tag weights. Used for meal-target banding.
+  const tagScoreOf = (r) => (r.tags || []).reduce((s, t) => s + (settings.tagWeights[t] || 10), 0);
+
   for (const meal of MEALS) {
     const emptySlots = DAYS.filter(d => !plan[d][meal]);
     if (emptySlots.length === 0) continue;
@@ -294,12 +297,40 @@ function generatePlan(recipes, existingPlan, settings) {
     const pool = eligible.filter(r => (r.mealTags || []).includes(mealKey));
     let remaining = [...emptySlots];
 
+    // Meal-target banding: accumulate tag-score for this meal type. Below the
+    // band's min, bias toward higher-scoring recipes to climb into band; once
+    // at/over max, taper score-heavy picks. Seed with any locked slots' scores.
+    const band = mealTargets?.[meal];
+    let mealScore = 0;
+    if (band) {
+      DAYS.forEach(d => {
+        const s = plan[d][meal];
+        if (s?.recipeId) {
+          const r = recipes.find(x => x.id === s.recipeId);
+          if (r) mealScore += tagScoreOf(r);
+        }
+      });
+    }
+
     let attempts = 0;
     while (remaining.length > 0 && attempts < 50) {
       attempts++;
       const weights = pool.map(r => {
-        if (usedRecipes.has(r.id)) return { r, w: calcWeight(r, settings, tagCounts) * 0.3 };
-        return { r, w: calcWeight(r, settings, tagCounts) };
+        let base = usedRecipes.has(r.id)
+          ? calcWeight(r, settings, tagCounts) * 0.3
+          : calcWeight(r, settings, tagCounts);
+        // Soft meal-target bias
+        if (band && base > 0) {
+          const score = tagScoreOf(r);
+          if (mealScore < band.min) {
+            // Below band: prefer recipes that move us toward min (favor higher score)
+            base *= 1 + (score / Math.max(1, band.max)) * 0.6;
+          } else if (mealScore >= band.max) {
+            // At/over band: taper score-heavy recipes (favor lighter ones)
+            base *= Math.max(0.3, 1 - (score / Math.max(1, band.max)) * 0.6);
+          }
+        }
+        return { r, w: base };
       }).filter(x => x.w > 0);
 
       if (weights.length === 0) break;
@@ -337,6 +368,7 @@ function generatePlan(recipes, existingPlan, settings) {
       remaining = remaining.slice(chunkSize);
       usedRecipes.add(picked.id);
       (picked.tags || []).forEach(t => { tagCounts[t] = (tagCounts[t] || 0) + chunkSize; });
+      if (band) mealScore += tagScoreOf(picked) * chunkSize;
     }
   }
   return plan;
