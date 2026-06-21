@@ -868,13 +868,25 @@ function RecipesTab({ recipes, setRecipes, settings, dictionary, setDictionary }
   return (
     <div>
       <Notif notifications={[...quarNotifs, ...freqNotifs]} />
-      <div style={{ display:"flex", gap:6, marginBottom:14, flexWrap:"wrap" }}>
-        {["all","favorites","quarantine"].map(f => (
-          <Btn key={f} small variant={filter===f?"primary":"ghost"} onClick={() => setFilter(f)}>
-            {f==="all"?"All ("+recipes.length+")":f==="favorites"?"★ Favorites":"🔴 Quarantined ("+recipes.filter(r=>r.quarantine).length+")"}
-          </Btn>
-        ))}
-      </div>
+      {recipes.length > 0 && (
+        <div style={{ display:"flex", gap:6, marginBottom:14, flexWrap:"wrap" }}>
+          {["all","favorites","quarantine"].map(f => (
+            <Btn key={f} small variant={filter===f?"primary":"ghost"} onClick={() => setFilter(f)}>
+              {f==="all"?"All ("+recipes.length+")":f==="favorites"?"★ Favorites":"🔴 Quarantined ("+recipes.filter(r=>r.quarantine).length+")"}
+            </Btn>
+          ))}
+        </div>
+      )}
+      {recipes.length === 0 && !showAdd && (
+        <div style={{ textAlign:"center", padding:"32px 20px 24px" }}>
+          <div style={{ fontSize:40, marginBottom:10 }}>🍳</div>
+          <div style={{ fontSize:17, fontWeight:700, marginBottom:6 }}>Add your first recipe</div>
+          <div style={{ fontSize:13, color:COLORS.textSec, marginBottom:18, lineHeight:1.45 }}>
+            Recipes are the building blocks — once you've added a few, the planner can build meal plans and shopping lists for you.
+          </div>
+          <Btn onClick={() => setShowAdd(true)} style={{ width:"100%" }}>+ Add a recipe</Btn>
+        </div>
+      )}
       <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
         {filtered.map(r => (
           <Card key={r.id} onClick={() => setExpandedId(expandedId===r.id?null:r.id)}>
@@ -963,7 +975,7 @@ function RecipesTab({ recipes, setRecipes, settings, dictionary, setDictionary }
       </div>
       <div style={{ marginTop:16 }}>
         {!showAdd ? (
-          <Btn onClick={() => setShowAdd(true)} style={{ width:"100%" }}>+ Add Recipe</Btn>
+          recipes.length > 0 && <Btn onClick={() => setShowAdd(true)} style={{ width:"100%" }}>+ Add Recipe</Btn>
         ) : (
           <Card style={{ border:`2px solid ${COLORS.primary}` }}>
             <div style={{ fontSize:14, fontWeight:700, color:COLORS.primary, marginBottom:10 }}>New Recipe</div>
@@ -1037,11 +1049,12 @@ function SubstitutionRow({ qi, onResolve }) {
 // ============================================================
 // PLAN TAB
 // ============================================================
-function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPantry, people, spices, setSpices }) {
+function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPantry, people, spices, setSpices, setTab }) {
   const [selectedSlot, setSelectedSlot] = useState(null);
   const [pickerSlot, setPickerSlot] = useState(null);
   const [pickerSearch, setPickerSearch] = useState("");
   const [cookModal, setCookModal] = useState(null); // { day, meal, recipe, lines, spices, untracked }
+  const [genMsg, setGenMsg] = useState("");
 
   // Scale factor for a recipe given the active household. With no portion
   // demand (empty/inactive roster), falls back to 1× (recipe-as-written).
@@ -1152,6 +1165,18 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
 
   function doGenerate() {
     const newPlan = generatePlan(recipes, plan, settings, activeIds);
+    // If generation filled nothing, tell the user why instead of failing
+    // silently. Most common cause: recipes exist but none are meal-tagged.
+    const filledCount = DAYS.reduce((a, d) => a + MEALS.filter(m => newPlan[d]?.[m]?.recipeId).length, 0);
+    const hadCount = DAYS.reduce((a, d) => a + MEALS.filter(m => plan?.[d]?.[m]?.recipeId).length, 0);
+    if (filledCount === hadCount) {
+      const anyMealTagged = recipes.some(r => (r.mealTags || []).length > 0);
+      setGenMsg(anyMealTagged
+        ? "Couldn't fill any slots — your active restrictions may be ruling everything out, or all slots are locked."
+        : "Your recipes need a meal (breakfast/lunch/dinner) tag before they can be planned. Add one in each recipe.");
+      setTimeout(() => setGenMsg(""), 5000);
+      return;
+    }
     setPlan(newPlan);
     // Count uses by SLOTS FILLED, not per-generation. A recipe occupying
     // 5 slots logs 5 timestamps so the frequency layer reflects real load.
@@ -1294,11 +1319,28 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
       <Notif notifications={notifications} />
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12, flexWrap:"wrap", gap:6 }}>
         <span style={{ fontSize:14, fontWeight:700 }}>Meal Plan</span>
-        <div style={{ display:"flex", gap:6 }}>
-          <Btn small variant="secondary" onClick={doRerollUnlocked}>🎲 Reroll</Btn>
-          <Btn small onClick={doGenerate}>Generate</Btn>
-        </div>
+        {recipes.length > 0 && (
+          <div style={{ display:"flex", gap:6 }}>
+            <Btn small variant="secondary" onClick={doRerollUnlocked}>🎲 Reroll</Btn>
+            <Btn small onClick={doGenerate}>Generate</Btn>
+          </div>
+        )}
       </div>
+      {genMsg && (
+        <div style={{ padding:"10px 12px", borderRadius:8, background:COLORS.quarantineBg, color:COLORS.quarantine, fontSize:12, fontWeight:500, marginBottom:12, lineHeight:1.4 }}>
+          {genMsg}
+        </div>
+      )}
+      {recipes.length === 0 && (
+        <div style={{ textAlign:"center", padding:"28px 20px", marginBottom:12, background:COLORS.surface, borderRadius:12, border:`1px dashed ${COLORS.border}` }}>
+          <div style={{ fontSize:34, marginBottom:8 }}>📋</div>
+          <div style={{ fontSize:16, fontWeight:700, marginBottom:6 }}>No recipes to plan with yet</div>
+          <div style={{ fontSize:13, color:COLORS.textSec, marginBottom:16, lineHeight:1.45 }}>
+            Add a few recipes first, then the planner can fill your week automatically.
+          </div>
+          <Btn onClick={() => setTab && setTab("Recipes")}>Go to Recipes</Btn>
+        </div>
+      )}
       <div style={{ overflowX:"auto", marginLeft:-4, marginRight:-4, paddingLeft:4, paddingRight:4 }}>
         <table style={{ width:"100%", borderCollapse:"separate", borderSpacing:3, minWidth:480 }}>
           <thead><tr>
@@ -1580,7 +1622,7 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
 // ============================================================
 // SHOP TAB
 // ============================================================
-function ShopTab({ plan, recipes, pantry, setPantry, spices, setSpices, settings, people }) {
+function ShopTab({ plan, recipes, pantry, setPantry, spices, setSpices, settings, people, setTab }) {
   // Active eater ids for scope-aware omission (M). Null when roster empty/all
   // inactive, so person-scoped restrictions don't omit anything.
   const activeIds = (() => {
@@ -1706,12 +1748,36 @@ function ShopTab({ plan, recipes, pantry, setPantry, spices, setSpices, settings
         </div>
       )}
 
-      {!generated ? (
-        <Card style={{ marginTop:12, textAlign:"center", padding:24 }}>
-          <div style={{ fontSize:13, color:COLORS.textSec, marginBottom:8 }}>Set up your meal plan first, then generate the shopping list</div>
-          <Btn onClick={doGenerate}>Generate from plan</Btn>
-        </Card>
-      ) : (
+      {!generated ? (() => {
+        const hasRecipes = recipes.length > 0;
+        const planHasMeals = DAYS.some(d => MEALS.some(m => plan?.[d]?.[m]?.recipeId));
+        if (!hasRecipes) {
+          return (
+            <Card style={{ marginTop:12, textAlign:"center", padding:24 }}>
+              <div style={{ fontSize:34, marginBottom:8 }}>🛒</div>
+              <div style={{ fontSize:16, fontWeight:700, marginBottom:6 }}>Nothing to shop for yet</div>
+              <div style={{ fontSize:13, color:COLORS.textSec, marginBottom:16, lineHeight:1.45 }}>Add a few recipes, then plan your week — your shopping list builds itself from there.</div>
+              <Btn onClick={() => setTab && setTab("Recipes")}>Go to Recipes</Btn>
+            </Card>
+          );
+        }
+        if (!planHasMeals) {
+          return (
+            <Card style={{ marginTop:12, textAlign:"center", padding:24 }}>
+              <div style={{ fontSize:34, marginBottom:8 }}>📋</div>
+              <div style={{ fontSize:16, fontWeight:700, marginBottom:6 }}>Plan your week first</div>
+              <div style={{ fontSize:13, color:COLORS.textSec, marginBottom:16, lineHeight:1.45 }}>Once your meal plan has some meals in it, generate the shopping list to see everything you need.</div>
+              <Btn onClick={() => setTab && setTab("Plan")}>Go to Meal Plan</Btn>
+            </Card>
+          );
+        }
+        return (
+          <Card style={{ marginTop:12, textAlign:"center", padding:24 }}>
+            <div style={{ fontSize:13, color:COLORS.textSec, marginBottom:8 }}>Your plan is ready — build the shopping list from it.</div>
+            <Btn onClick={doGenerate}>Generate shopping list</Btn>
+          </Card>
+        );
+      })() : (
         <>
           <div style={{ display:"flex", gap:6, marginBottom:10 }}>
             <Btn small variant={groupBy==="category"?"primary":"ghost"} onClick={() => setGroupBy("category")}>By category</Btn>
@@ -1809,17 +1875,23 @@ function PantryTab({ pantry, setPantry, spices, setSpices }) {
         <span style={{ fontSize:14, fontWeight:700 }}>Pantry ({pantry.length})</span>
         <Btn small onClick={() => setShowAdd(!showAdd)}>+ Add</Btn>
       </div>
-      <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:10 }}>
-        {pantry.filter(p => p.floor > 0 && p.qty <= p.floor).length} at or below floor
-      </div>
-
-      <div style={{ display:"flex", gap:4, marginBottom:12, flexWrap:"wrap" }}>
-        <Btn small variant={storageFilter==="all"?"primary":"ghost"} onClick={() => setStorageFilter("all")}>All</Btn>
-        {Object.entries(SC).map(([key, sc]) => (
-          <Btn key={key} small variant={storageFilter===key?"primary":"ghost"} onClick={() => setStorageFilter(key)} style={storageFilter===key?{ background:sc.fg }:{ color:sc.fg, borderColor:sc.fg }}>{sc.label} ({counts[key]||0})</Btn>
-        ))}
-      </div>
-
+      {pantry.length > 0 ? (
+        <>
+          <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:10 }}>
+            {pantry.filter(p => p.floor > 0 && p.qty <= p.floor).length} at or below floor
+          </div>
+          <div style={{ display:"flex", gap:4, marginBottom:12, flexWrap:"wrap" }}>
+            <Btn small variant={storageFilter==="all"?"primary":"ghost"} onClick={() => setStorageFilter("all")}>All</Btn>
+            {Object.entries(SC).map(([key, sc]) => (
+              <Btn key={key} small variant={storageFilter===key?"primary":"ghost"} onClick={() => setStorageFilter(key)} style={storageFilter===key?{ background:sc.fg }:{ color:sc.fg, borderColor:sc.fg }}>{sc.label} ({counts[key]||0})</Btn>
+            ))}
+          </div>
+        </>
+      ) : !showAdd && (
+        <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:12, lineHeight:1.45 }}>
+          Track what's on hand so it's subtracted from your shopping list. Optional — add items as you go, or let your shopping flow in here when you check things off.
+        </div>
+      )}
       {showAdd && (
         <Card style={{ border:`2px solid ${COLORS.primary}`, marginBottom:12 }}>
           <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
@@ -2460,8 +2532,8 @@ export default function App() {
       </div>
       <div style={{ flex:1, padding:"12px 16px 90px", overflowY:"auto" }}>
         {tab === "Recipes" && <RecipesTab recipes={recipes} setRecipes={setRecipes} settings={settings} dictionary={dictionary} setDictionary={setDictionary} />}
-        {tab === "Plan" && <PlanTab recipes={recipes} setRecipes={setRecipes} plan={plan} setPlan={setPlan} settings={settings} pantry={pantry} setPantry={setPantry} people={people} spices={spices} setSpices={setSpices} />}
-        {tab === "Shop" && <ShopTab plan={plan} recipes={recipes} pantry={pantry} setPantry={setPantry} spices={spices} setSpices={setSpices} settings={settings} people={people} />}
+        {tab === "Plan" && <PlanTab recipes={recipes} setRecipes={setRecipes} plan={plan} setPlan={setPlan} settings={settings} pantry={pantry} setPantry={setPantry} people={people} spices={spices} setSpices={setSpices} setTab={setTab} />}
+        {tab === "Shop" && <ShopTab plan={plan} recipes={recipes} pantry={pantry} setPantry={setPantry} spices={spices} setSpices={setSpices} settings={settings} people={people} setTab={setTab} />}
         {tab === "Pantry" && <PantryTab pantry={pantry} setPantry={setPantry} spices={spices} setSpices={setSpices} />}
         {tab === "Settings" && <SettingsTab settings={settings} setSettings={setSettings} people={people} setPeople={setPeople} />}
       </div>
