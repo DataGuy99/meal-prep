@@ -1524,11 +1524,24 @@ export default function App() {
   const [settings, setSettingsRaw] = useState(() => load("settings", DEFAULT_SETTINGS));
   const [dictionary, setDictionaryRaw] = useState(() => load("dictionary", []));
 
-  const setRecipes = useCallback(v => { const val = typeof v === "function" ? v(recipes) : v; setRecipesRaw(val); save("recipes", val); }, [recipes]);
-  const setPantry = useCallback(v => { const val = typeof v === "function" ? v(pantry) : v; setPantryRaw(val); save("pantry", val); }, [pantry]);
-  const setPlan = useCallback(v => { const val = typeof v === "function" ? v(plan) : v; setPlanRaw(val); save("plan", val); }, [plan]);
-  const setSettings = useCallback(v => { const val = typeof v === "function" ? v(settings) : v; setSettingsRaw(val); save("settings", val); }, [settings]);
-  const setDictionary = useCallback(v => { const val = typeof v === "function" ? v(dictionary) : v; setDictionaryRaw(val); save("dictionary", val); }, [dictionary]);
+  // Persist INSIDE the functional updater so React supplies the true latest
+  // state (no stale closure), and we save exactly what we commit. Empty dep
+  // arrays keep these callback identities stable across renders.
+  const setRecipes = useCallback(v => {
+    setRecipesRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("recipes", next); return next; });
+  }, []);
+  const setPantry = useCallback(v => {
+    setPantryRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("pantry", next); return next; });
+  }, []);
+  const setPlan = useCallback(v => {
+    setPlanRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("plan", next); return next; });
+  }, []);
+  const setSettings = useCallback(v => {
+    setSettingsRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("settings", next); return next; });
+  }, []);
+  const setDictionary = useCallback(v => {
+    setDictionaryRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("dictionary", next); return next; });
+  }, []);
 
   return (
     <div style={{ minHeight:"100vh", background:COLORS.bg, fontFamily:'-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', color:COLORS.text, display:"flex", flexDirection:"column" }}>
