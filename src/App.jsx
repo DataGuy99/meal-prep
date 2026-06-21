@@ -182,6 +182,13 @@ function findMatch(input, dictionary, threshold = 2) {
   return bestDist <= threshold ? best : norm;
 }
 
+// Conglomerate a tag into an existing canonical tag via normalize + fuzzy
+// match, so "beefs"/"Beef"/"beef " all collapse to one "beef". Returns the
+// canonical form. knownTags is the set of tags already in use.
+function canonicalizeTag(input, knownTags) {
+  return findMatch(input, knownTags, 2);
+}
+
 function parseIngredientLine(line) {
   line = line.trim();
   if (!line) return null;
@@ -640,6 +647,73 @@ const StarRating = ({ rating, size = 16, onChange }) => (
   </div>
 );
 
+// Continuous blue→red preference scale. Drag the dot anywhere; value is read
+// from pointer position as a float in [min,max]. Blue end = less, red = more,
+// center = neutral. Touch + mouse. Optional editable number (showNumber) lets
+// a user type an exact value beside the scale.
+function GradientScale({ value, min = 0, max = 100, onChange, showNumber = false, height = 14, label, leftLabel, rightLabel }) {
+  const barRef = useRef(null);
+  const dragging = useRef(false);
+
+  const clamp = (v) => Math.max(min, Math.min(max, v));
+  const pct = ((clamp(value) - min) / (max - min)) * 100;
+
+  const valueFromClientX = (clientX) => {
+    const rect = barRef.current.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    return clamp(min + ratio * (max - min));
+  };
+
+  const handleDown = (clientX) => { dragging.current = true; onChange(Math.round(valueFromClientX(clientX) * 100) / 100); };
+  const handleMove = (clientX) => { if (dragging.current) onChange(Math.round(valueFromClientX(clientX) * 100) / 100); };
+  const handleUp = () => { dragging.current = false; };
+
+  useEffect(() => {
+    const mm = (e) => handleMove(e.clientX);
+    const mu = () => handleUp();
+    const tm = (e) => { if (e.touches[0]) handleMove(e.touches[0].clientX); };
+    window.addEventListener("mousemove", mm);
+    window.addEventListener("mouseup", mu);
+    window.addEventListener("touchmove", tm, { passive: false });
+    window.addEventListener("touchend", mu);
+    return () => {
+      window.removeEventListener("mousemove", mm);
+      window.removeEventListener("mouseup", mu);
+      window.removeEventListener("touchmove", tm);
+      window.removeEventListener("touchend", mu);
+    };
+  }, [min, max]);
+
+  return (
+    <div style={{ width: "100%" }}>
+      {label && <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>{label}</div>}
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div
+          ref={barRef}
+          onMouseDown={e => handleDown(e.clientX)}
+          onTouchStart={e => { if (e.touches[0]) handleDown(e.touches[0].clientX); }}
+          style={{ position: "relative", flex: 1, height, borderRadius: height/2, cursor: "pointer", touchAction: "none",
+            background: "linear-gradient(90deg, #3A6FB0 0%, #B8B0C0 50%, #C4532A 100%)" }}
+        >
+          <div style={{ position: "absolute", top: "50%", left: `${pct}%`, transform: "translate(-50%, -50%)",
+            width: height + 8, height: height + 8, borderRadius: "50%", background: "#fff",
+            border: `2px solid ${COLORS.text}`, boxShadow: "0 1px 4px rgba(0,0,0,0.25)", pointerEvents: "none" }} />
+        </div>
+        {showNumber && (
+          <input type="number" value={Math.round(clamp(value))} onChange={e => onChange(clamp(+e.target.value))}
+            style={{ width: 48, padding: "4px 6px", borderRadius: 5, border: `1px solid ${COLORS.border}`, fontSize: 13, textAlign: "center" }} />
+        )}
+      </div>
+      {(leftLabel || rightLabel) && (
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}>
+          <span style={{ fontSize: 9, color: COLORS.textSec }}>{leftLabel}</span>
+          <span style={{ fontSize: 9, color: COLORS.textSec }}>{rightLabel}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const Badge = ({ children, color, bg, style: s }) => (
   <span style={{ display:"inline-block", padding:"2px 8px", borderRadius:99, fontSize:11, fontWeight:600, color, background:bg, whiteSpace:"nowrap", ...s }}>{children}</span>
 );
@@ -897,7 +971,12 @@ function RecipesTab({ recipes, setRecipes, settings, dictionary, setDictionary }
               <input placeholder="Recipe name" value={addForm.name} onChange={e => setAddForm(p => ({ ...p, name: e.target.value }))} style={{ padding:"8px 10px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:14 }} />
               <div>
                 <div style={{ fontSize:11, color:COLORS.textSec, marginBottom:3, fontWeight:600 }}>Category tags</div>
-                <Combobox multi options={allTags} placeholder="Type or select..." selected={addForm.tags} onChange={v => setAddForm(p => ({ ...p, tags: v }))} />
+                <Combobox multi options={allTags} placeholder="Type or select..." selected={addForm.tags} onChange={v => {
+                  // Conglomerate fuzzy/plural variants into canonical tags.
+                  const known = allTags.filter(t => !v.includes(t));
+                  const merged = [...new Set(v.map(t => canonicalizeTag(t, [...known, ...DEFAULT_TAGS])))];
+                  setAddForm(p => ({ ...p, tags: merged }));
+                }} />
               </div>
               <div>
                 <div style={{ fontSize:11, color:COLORS.textSec, marginBottom:3, fontWeight:600 }}>Meal suitability</div>
@@ -1875,14 +1954,13 @@ function SettingsTab({ settings, setSettings, people, setPeople }) {
   return (
     <div>
       <div style={{ display:"flex", gap:4, marginBottom:14, flexWrap:"wrap" }}>
-        {[["people","People"],["weights","Tag Weights"],["targets","Meal Targets"],["ranges","Ranges"],["redlist","Red List"],["excludes","Excludes"],["boosts","Boosts"],["cooking","Cooking"],["data","Data"]].map(([k, l]) => (
+        {[["people","People"],["preferences","Preferences"],["ranges","Ranges"],["redlist","Red List"],["excludes","Excludes"],["boosts","Boosts"],["cooking","Cooking"],["data","Data"]].map(([k, l]) => (
           <Btn key={k} small variant={section===k?"primary":"ghost"} onClick={() => setSection(k)}>{l}</Btn>
         ))}
       </div>
 
       {section === "people" && <PeopleSection people={people} setPeople={setPeople} />}
-      {section === "weights" && <TagWeightsSection tagWeights={settings.tagWeights} onChange={v => update("tagWeights", v)} />}
-      {section === "targets" && <MealTargetsSection targets={settings.mealTargets} onChange={v => update("mealTargets", v)} />}
+      {section === "preferences" && <CalibrationSection settings={settings} update={update} />}
       {section === "ranges" && <RangesSection ranges={settings.ranges} onChange={v => update("ranges", v)} tagWeights={settings.tagWeights} />}
       {section === "redlist" && <RedListSection redList={settings.redList} onChange={v => update("redList", v)} />}
       {section === "excludes" && <ExcludesSection excludes={settings.excludes} onChange={v => update("excludes", v)} people={people} />}
@@ -1997,46 +2075,95 @@ function CookingSection({ settings, update }) {
   );
 }
 
-function TagWeightsSection({ tagWeights, onChange }) {
-  const [newTag, setNewTag] = useState("");
-  const entries = Object.entries(tagWeights).sort((a, b) => b[1] - a[1]);
-  return (
-    <div>
-      <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:10 }}>Weight per tag — drives randomization probability</div>
-      {entries.map(([tag, w]) => (
-        <div key={tag} style={{ display:"flex", alignItems:"center", gap:10, marginBottom:6 }}>
-          <span style={{ fontSize:13, fontWeight:600, minWidth:80 }}>{tag}</span>
-          <div style={{ flex:1, height:6, borderRadius:3, background:COLORS.border }}>
-            <div style={{ width:`${w}%`, height:6, borderRadius:3, background:COLORS.primary }} />
-          </div>
-          <input type="number" value={w} onChange={e => onChange({ ...tagWeights, [tag]: Math.max(0, Math.min(100, +e.target.value)) })} style={{ width:44, padding:"3px 5px", borderRadius:4, border:`1px solid ${COLORS.border}`, fontSize:12, textAlign:"center" }} />
-          <span style={{ fontSize:13, cursor:"pointer", color:COLORS.red }} onClick={() => { const next = { ...tagWeights }; delete next[tag]; onChange(next); }}>×</span>
-        </div>
-      ))}
-      <div style={{ display:"flex", gap:6, marginTop:8 }}>
-        <input value={newTag} onChange={e => setNewTag(e.target.value)} placeholder="New tag..." style={{ flex:1, padding:"6px 10px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13 }} />
-        <Btn small onClick={() => { if (newTag.trim()) { onChange({ ...tagWeights, [newTag.toLowerCase().trim()]: 15 }); setNewTag(""); } }}>Add</Btn>
-      </div>
-    </div>
-  );
+// Meal heaviness <-> target band translation. A single 0-100 heaviness maps
+// to a score band centered on that value with a fixed half-width.
+const HEAVY_HALF = 20;
+function heavinessToBand(h) {
+  const center = Math.max(0, Math.min(140, h));
+  return { min: Math.max(0, Math.round(center - HEAVY_HALF)), max: Math.round(center + HEAVY_HALF) };
+}
+function bandToHeaviness(band) {
+  if (!band) return 50;
+  return Math.round((band.min + band.max) / 2);
 }
 
-function MealTargetsSection({ targets, onChange }) {
+function CalibrationSection({ settings, update }) {
+  const [advanced, setAdvanced] = useState(false);
+  const [newTag, setNewTag] = useState("");
+  const tagWeights = settings.tagWeights || {};
+  const targets = settings.mealTargets || {};
+  const entries = Object.entries(tagWeights).sort((a, b) => a[0].localeCompare(b[0]));
+
+  const setTag = (tag, val) => update("tagWeights", { ...tagWeights, [tag]: Math.max(0, Math.min(100, Math.round(val))) });
+  const removeTag = (tag) => { const next = { ...tagWeights }; delete next[tag]; update("tagWeights", next); };
+  const addTag = () => {
+    if (!newTag.trim()) return;
+    const canon = canonicalizeTag(newTag, Object.keys(tagWeights));
+    if (!(canon in tagWeights)) update("tagWeights", { ...tagWeights, [canon]: 50 });
+    setNewTag("");
+  };
+  const setMeal = (m, h) => update("mealTargets", { ...targets, [m]: heavinessToBand(h) });
+
   return (
     <div>
-      <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:10 }}>Target tag-score range per meal type</div>
-      {MEALS.map(m => {
-        const t = targets[m] || { min:50, max:80 };
-        return (
-          <div key={m} style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10, padding:"10px 12px", borderRadius:8, background:COLORS.surface }}>
-            <div style={{ width:4, height:32, borderRadius:2, background:MC[m].fg }} />
-            <span style={{ fontSize:14, fontWeight:700, color:MC[m].fg, minWidth:80 }}>{m}</span>
-            <input type="number" value={t.min} onChange={e => onChange({ ...targets, [m]: { ...t, min: +e.target.value } })} style={{ width:50, padding:"4px 6px", borderRadius:4, border:`1px solid ${COLORS.border}`, fontSize:13, textAlign:"center" }} />
-            <span style={{ color:COLORS.textSec }}>–</span>
-            <input type="number" value={t.max} onChange={e => onChange({ ...targets, [m]: { ...t, max: +e.target.value } })} style={{ width:50, padding:"4px 6px", borderRadius:4, border:`1px solid ${COLORS.border}`, fontSize:13, textAlign:"center" }} />
+      <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:14 }}>
+        Slide toward <span style={{ color:"#C4532A", fontWeight:600 }}>more</span> or <span style={{ color:"#3A6FB0", fontWeight:600 }}>less</span> to shape what shows up in your plans. Center is neutral.
+      </div>
+
+      <SectionLabel>Food preferences</SectionLabel>
+      <div style={{ display:"flex", flexDirection:"column", gap:12, marginBottom:8 }}>
+        {entries.map(([tag, w]) => (
+          <div key={tag}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:3 }}>
+              <span style={{ fontSize:13, fontWeight:600 }}>{tag}</span>
+              <span style={{ fontSize:13, cursor:"pointer", color:COLORS.textSec }} onClick={() => removeTag(tag)}>×</span>
+            </div>
+            <GradientScale value={w} min={0} max={100} onChange={v => setTag(tag, v)} showNumber leftLabel="less" rightLabel="more" />
           </div>
-        );
-      })}
+        ))}
+      </div>
+      <div style={{ display:"flex", gap:6, marginTop:10 }}>
+        <input value={newTag} onChange={e => setNewTag(e.target.value)} placeholder="Add a food type..." style={{ flex:1, padding:"8px 10px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13 }} />
+        <Btn small onClick={addTag}>Add</Btn>
+      </div>
+
+      <SectionLabel>Meal heaviness</SectionLabel>
+      <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+        {MEALS.map(m => (
+          <div key={m}>
+            <div style={{ fontSize:13, fontWeight:700, color:MC[m].fg, marginBottom:3 }}>{m}</div>
+            <GradientScale value={bandToHeaviness(targets[m])} min={0} max={140} onChange={h => setMeal(m, h)} leftLabel="light" rightLabel="heavy" />
+          </div>
+        ))}
+      </div>
+
+      <div onClick={() => setAdvanced(a => !a)} style={{ marginTop:18, padding:"8px 0", fontSize:12, color:COLORS.textSec, cursor:"pointer", borderTop:`1px solid ${COLORS.border}` }}>
+        {advanced ? "▲" : "▼"} Advanced — exact values
+      </div>
+      {advanced && (
+        <div style={{ paddingTop:8 }}>
+          <div style={{ fontSize:11, color:COLORS.textSec, marginBottom:8 }}>The raw numbers behind the scales. Tweak directly if you want precise control.</div>
+          <div style={{ fontSize:11, fontWeight:700, marginBottom:4 }}>Tag weights (0–100)</div>
+          {entries.map(([tag, w]) => (
+            <div key={tag} style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4 }}>
+              <span style={{ fontSize:12, flex:1 }}>{tag}</span>
+              <input type="number" value={w} onChange={e => setTag(tag, +e.target.value)} style={{ width:54, padding:"3px 5px", borderRadius:4, border:`1px solid ${COLORS.border}`, fontSize:12, textAlign:"center" }} />
+            </div>
+          ))}
+          <div style={{ fontSize:11, fontWeight:700, margin:"10px 0 4px" }}>Meal target bands (score min–max)</div>
+          {MEALS.map(m => {
+            const t = targets[m] || { min:50, max:80 };
+            return (
+              <div key={m} style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
+                <span style={{ fontSize:12, minWidth:70 }}>{m}</span>
+                <input type="number" value={t.min} onChange={e => update("mealTargets", { ...targets, [m]: { ...t, min:+e.target.value } })} style={{ width:50, padding:"3px 5px", borderRadius:4, border:`1px solid ${COLORS.border}`, fontSize:12, textAlign:"center" }} />
+                <span style={{ color:COLORS.textSec }}>–</span>
+                <input type="number" value={t.max} onChange={e => update("mealTargets", { ...targets, [m]: { ...t, max:+e.target.value } })} style={{ width:50, padding:"3px 5px", borderRadius:4, border:`1px solid ${COLORS.border}`, fontSize:12, textAlign:"center" }} />
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
