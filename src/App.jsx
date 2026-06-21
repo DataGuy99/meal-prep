@@ -718,6 +718,29 @@ const Badge = ({ children, color, bg, style: s }) => (
   <span style={{ display:"inline-block", padding:"2px 8px", borderRadius:99, fontSize:11, fontWeight:600, color, background:bg, whiteSpace:"nowrap", ...s }}>{children}</span>
 );
 
+// A recipe tag that, when tapped, expands to a mini gradient scale for that
+// tag's global preference (same value the survey + Settings edit). The third
+// edit surface for tag weights. If the tag isn't in tagWeights yet, tapping
+// seeds it at neutral.
+function TagPrefBadge({ tag, settings, setSettings }) {
+  const [open, setOpen] = useState(false);
+  const weight = settings.tagWeights?.[tag] ?? NEUTRAL_WEIGHT;
+  const setWeight = (v) => setSettings(prev => ({ ...prev, tagWeights: { ...prev.tagWeights, [tag]: Math.max(0, Math.min(100, Math.round(v))) } }));
+  return (
+    <div style={{ display:"inline-block" }}>
+      <span onClick={e => { e.stopPropagation(); setOpen(o => !o); }} style={{ display:"inline-flex", alignItems:"center", gap:3, padding:"2px 8px", borderRadius:99, fontSize:11, fontWeight:600, color:COLORS.primary, background:`${COLORS.primary}18`, cursor:"pointer", whiteSpace:"nowrap" }}>
+        {tag} <span style={{ fontSize:8, opacity:0.7 }}>{open ? "▲" : "▾"}</span>
+      </span>
+      {open && (
+        <div onClick={e => e.stopPropagation()} style={{ marginTop:6, marginBottom:4, padding:"8px 10px", borderRadius:8, background:COLORS.surface, border:`1px solid ${COLORS.border}` }}>
+          <div style={{ fontSize:10, color:COLORS.textSec, marginBottom:5 }}>Preference for <b style={{ textTransform:"capitalize" }}>{tag}</b> across all plans</div>
+          <GradientScale value={weight} min={0} max={100} onChange={setWeight} showNumber leftLabel="less" rightLabel="more" />
+        </div>
+      )}
+    </div>
+  );
+}
+
 const Card = ({ children, style, onClick }) => (
   <div onClick={onClick} style={{ background:COLORS.surface, borderRadius:10, padding:"12px 14px", border:`1px solid ${COLORS.border}`, cursor:onClick?"pointer":"default", ...style }}>{children}</div>
 );
@@ -795,7 +818,7 @@ const Notif = ({ notifications }) => {
 // ============================================================
 // RECIPES TAB
 // ============================================================
-function RecipesTab({ recipes, setRecipes, settings, dictionary, setDictionary }) {
+function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, setDictionary }) {
   const [filter, setFilter] = useState("all");
   const [expandedId, setExpandedId] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
@@ -929,6 +952,14 @@ function RecipesTab({ recipes, setRecipes, settings, dictionary, setDictionary }
                     <input type="number" value={r.servings} onChange={e => updateRecipe(r.id, { servings: Math.max(1, +e.target.value) })} style={{ width:50, padding:"3px 5px", borderRadius:4, border:`1px solid ${COLORS.border}`, fontSize:13, textAlign:"center", marginTop:2 }} />
                   </div>
                 </div>
+                {(r.tags || []).length > 0 && (
+                  <div style={{ marginBottom:10 }}>
+                    <div style={{ fontSize:10, color:COLORS.textSec, fontWeight:600, marginBottom:4 }}>Tags — tap to set how often this kind shows up</div>
+                    <div style={{ display:"flex", gap:5, flexWrap:"wrap", alignItems:"flex-start" }}>
+                      {(r.tags || []).map(t => <TagPrefBadge key={t} tag={t} settings={settings} setSettings={setSettings} />)}
+                    </div>
+                  </div>
+                )}
                 {(() => {
                   const renderIng = (ing, idx) => {
                     const isRed = settings.redList.some(rl => normalize(rl) === normalize(ing.name));
@@ -2531,7 +2562,7 @@ export default function App() {
         <div style={{ fontSize:20, fontWeight:800, color:COLORS.primary, letterSpacing:-0.5 }}>Prep</div>
       </div>
       <div style={{ flex:1, padding:"12px 16px 90px", overflowY:"auto" }}>
-        {tab === "Recipes" && <RecipesTab recipes={recipes} setRecipes={setRecipes} settings={settings} dictionary={dictionary} setDictionary={setDictionary} />}
+        {tab === "Recipes" && <RecipesTab recipes={recipes} setRecipes={setRecipes} settings={settings} setSettings={setSettings} dictionary={dictionary} setDictionary={setDictionary} />}
         {tab === "Plan" && <PlanTab recipes={recipes} setRecipes={setRecipes} plan={plan} setPlan={setPlan} settings={settings} pantry={pantry} setPantry={setPantry} people={people} spices={spices} setSpices={setSpices} setTab={setTab} />}
         {tab === "Shop" && <ShopTab plan={plan} recipes={recipes} pantry={pantry} setPantry={setPantry} spices={spices} setSpices={setSpices} settings={settings} people={people} setTab={setTab} />}
         {tab === "Pantry" && <PantryTab pantry={pantry} setPantry={setPantry} spices={spices} setSpices={setSpices} />}
