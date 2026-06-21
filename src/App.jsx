@@ -18,6 +18,7 @@ const COLORS = {
   cold: "#2E7D9B", coldBg: "#DFF0F7",
   frozen: "#5C6BC0", frozenBg: "#E3E6F5",
   lock: "#6D4C91",
+  gold: "#C8960C", goldBg: "#FBF3DA",
 };
 const MC = {
   Breakfast: { bg: COLORS.breakfastBg, fg: COLORS.breakfast },
@@ -35,6 +36,36 @@ const TABS = ["Recipes","Plan","Shop","Pantry","Settings"];
 const DEFAULT_TAGS = ["chicken","beef","pork","seafood","fish","salad","grain","pasta","soup","pastry","vegetarian","curry","stir-fry","sandwich","bowl","stew"];
 const DEFAULT_STORES = ["aldi","costco","walmart","kroger","trader joes","butcher","farmers market","other"];
 const UNITS = ["","g","kg","oz","lb","ml","L","cup","tbsp","tsp","pcs","can","bottle","bag","head","bunch","clove","stalk","block","tub","fillet","slice"];
+
+// People roster: profile types map to a portion weight (1 adult man = 1.0).
+// All editable per-person; these are just the starting presets.
+const PROFILE_TYPES = [
+  { key: "man", label: "Man", weight: 1.0 },
+  { key: "woman", label: "Woman", weight: 0.75 },
+  { key: "teen", label: "Teen", weight: 0.85 },
+  { key: "child", label: "Child", weight: 0.5 },
+  { key: "toddler", label: "Toddler", weight: 0.3 },
+];
+// Attendance frequency: when present, how often they actually eat.
+const ATTENDANCE = [
+  { key: "every", label: "Every meal", factor: 1.0 },
+  { key: "most", label: "Most", factor: 0.75 },
+  { key: "sporadic", label: "Sporadic", factor: 0.5 },
+  { key: "occasional", label: "Occasional", factor: 0.25 },
+];
+
+// Household portion demand = sum over active people of (weight × attendance).
+// Empty/all-inactive roster returns 0, signaling callers to fall back to the
+// recipe's own serving count.
+function portionDemand(people) {
+  if (!people || people.length === 0) return 0;
+  return people.reduce((sum, p) => {
+    if (!p.active) return sum;
+    const w = typeof p.weight === "number" ? p.weight : 1;
+    const a = typeof p.attendance === "number" ? p.attendance : 1;
+    return sum + w * a;
+  }, 0);
+}
 
 // ============================================================
 // PERSISTENCE
@@ -819,10 +850,110 @@ function SubstitutionRow({ qi, onResolve }) {
 // ============================================================
 // PLAN TAB
 // ============================================================
-function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
+function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPantry, people }) {
   const [selectedSlot, setSelectedSlot] = useState(null);
   const [pickerSlot, setPickerSlot] = useState(null);
   const [pickerSearch, setPickerSearch] = useState("");
+  const [cookModal, setCookModal] = useState(null); // { day, meal, recipe, lines, spices, untracked }
+
+  // Scale factor for a recipe given the active household. With no portion
+  // demand (empty/inactive roster), falls back to 1× (recipe-as-written).
+  const demand = portionDemand(people);
+  const scaleFor = (recipe) => {
+    if (demand <= 0) return 1;
+    const base = recipe.servings || 1;
+    return demand / base;
+  };
+
+  // Build the consumption breakdown for a recipe at the current scale.
+  function buildCookLines(recipe) {
+    const factor = scaleFor(recipe);
+    const tracked = [], spices = [], untracked = [];
+    for (const ing of recipe.ingredients) {
+      const cat = guessCategory(ing.name);
+      if (cat === "Spices") { spices.push(ing.name); continue; }
+      const need = (ing.qty || 1) * factor;
+      const pItem = pantry.find(p => normalize(p.name) === normalize(ing.name));
+      if (pItem) {
+        const info = unitInfo(ing.unit), pInfo = unitInfo(pItem.unit);
+        // Only deduct if units share a family; otherwise treat as untracked-unit.
+        if (info.family === pInfo.family) {
+          const deductBase = need * info.factor;
+          const haveBase = pItem.qty * pInfo.factor;
+          const afterBase = haveBase - deductBase;
+          tracked.push({
+            id: pItem.id, name: ing.name, unit: pItem.unit,
+            deduct: round1(deductBase / pInfo.factor),
+            have: pItem.qty,
+            after: round1(Math.max(0, afterBase) / pInfo.factor),
+          });
+        } else {
+          untracked.push({ name: ing.name, reason: "unit mismatch" });
+        }
+      } else {
+        untracked.push({ name: ing.name, reason: "not in pantry" });
+      }
+    }
+    return { factor, tracked, spices, untracked };
+  }
+
+  function applyCook(day, meal, recipe, lines) {
+    // Decrement tracked pantry items.
+    setPantry(prev => prev.map(p => {
+      const line = lines.tracked.find(l => l.id === p.id);
+      if (!line) return p;
+      return { ...p, qty: line.after };
+    }));
+    // Mark slot cooked (implies locked).
+    setPlan(prev => {
+      const next = JSON.parse(JSON.stringify(prev));
+      if (next[day]?.[meal]) {
+        next[day][meal].cooked = true;
+        next[day][meal].cookedAt = Date.now();
+        next[day][meal].locked = true;
+      }
+      return next;
+    });
+    setCookModal(null);
+    setSelectedSlot(null);
+  }
+
+  function startCook(day, meal) {
+    const slot = plan?.[day]?.[meal];
+    if (!slot?.recipeId) return;
+    const recipe = recipes.find(r => r.id === slot.recipeId);
+    if (!recipe) return;
+    const lines = buildCookLines(recipe);
+    if (settings.autoDecrement) {
+      applyCook(day, meal, recipe, lines);
+    } else {
+      setCookModal({ day, meal, recipe, ...lines });
+    }
+  }
+
+  function uncook(day, meal) {
+    // Reverse: add back the deducted quantities, clear cooked flag.
+    const slot = plan?.[day]?.[meal];
+    if (!slot?.recipeId) return;
+    const recipe = recipes.find(r => r.id === slot.recipeId);
+    if (recipe) {
+      const lines = buildCookLines(recipe);
+      setPantry(prev => prev.map(p => {
+        const line = lines.tracked.find(l => l.id === p.id);
+        if (!line) return p;
+        return { ...p, qty: round1(p.qty + line.deduct) };
+      }));
+    }
+    setPlan(prev => {
+      const next = JSON.parse(JSON.stringify(prev));
+      if (next[day]?.[meal]) {
+        delete next[day][meal].cooked;
+        delete next[day][meal].cookedAt;
+      }
+      return next;
+    });
+    setSelectedSlot(null);
+  }
 
   function doGenerate() {
     const newPlan = generatePlan(recipes, plan, settings);
@@ -989,8 +1120,9 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
                   return (
                     <td key={m} style={{ padding:2, verticalAlign:"top" }}>
                       {slot ? (
-                        <div onClick={() => { setSelectedSlot({ day:d, meal:m }); setPickerSlot(null); }} style={{ background:slot.placeholder?COLORS.surface:MC[m].bg, border:`1.5px ${slot.placeholder?"dashed":"solid"} ${isSel?(slot.placeholder?COLORS.textSec:MC[m].fg):(slot.placeholder?COLORS.border:`${MC[m].fg}40`)}`, borderRadius:6, padding:"4px 6px", minHeight:36, position:"relative", cursor:"pointer" }}>
-                          {slot.locked && !slot.placeholder && <span style={{ position:"absolute", top:2, right:3, fontSize:9, color:COLORS.lock }}>🔒</span>}
+                        <div onClick={() => { setSelectedSlot({ day:d, meal:m }); setPickerSlot(null); }} style={{ background:slot.placeholder?COLORS.surface:(slot.cooked?COLORS.goldBg:MC[m].bg), border:`${slot.cooked?2:1.5}px ${slot.placeholder?"dashed":"solid"} ${slot.cooked?COLORS.gold:(isSel?(slot.placeholder?COLORS.textSec:MC[m].fg):(slot.placeholder?COLORS.border:`${MC[m].fg}40`))}`, borderRadius:6, padding:"4px 6px", minHeight:36, position:"relative", cursor:"pointer" }}>
+                          {slot.cooked && <span style={{ position:"absolute", top:2, right:3, fontSize:10 }}>✓</span>}
+                          {slot.locked && !slot.placeholder && !slot.cooked && <span style={{ position:"absolute", top:2, right:3, fontSize:9, color:COLORS.lock }}>🔒</span>}
                           {slot.placeholder ? (
                             <div style={{ fontSize:11, fontWeight:600, color:COLORS.textSec, lineHeight:1.2, display:"flex", alignItems:"center", gap:3 }}>
                               <span style={{ fontSize:10 }}>🍽️</span> {slot.recipeName}
@@ -1089,19 +1221,33 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
         );
       })()}
 
-      {selectedSlot && plan?.[selectedSlot.day]?.[selectedSlot.meal] && (
-        <Card style={{ marginTop:10, border:`2px solid ${plan[selectedSlot.day][selectedSlot.meal].placeholder ? COLORS.textSec : MC[selectedSlot.meal].fg}` }}>
+      {selectedSlot && plan?.[selectedSlot.day]?.[selectedSlot.meal] && (() => {
+        const sl = plan[selectedSlot.day][selectedSlot.meal];
+        const borderC = sl.placeholder ? COLORS.textSec : (sl.cooked ? COLORS.gold : MC[selectedSlot.meal].fg);
+        return (
+        <Card style={{ marginTop:10, border:`2px solid ${borderC}` }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
-            <span style={{ fontSize:13, fontWeight:700 }}>{selectedSlot.day} {selectedSlot.meal}: {plan[selectedSlot.day][selectedSlot.meal].recipeName}</span>
+            <span style={{ fontSize:13, fontWeight:700 }}>
+              {sl.cooked && <span style={{ color:COLORS.gold, marginRight:4 }}>✓</span>}
+              {selectedSlot.day} {selectedSlot.meal}: {sl.recipeName}
+            </span>
             <span style={{ fontSize:11, color:COLORS.textSec, cursor:"pointer" }} onClick={() => setSelectedSlot(null)}>✕</span>
           </div>
+          {sl.cooked && (
+            <div style={{ fontSize:11, color:COLORS.gold, marginBottom:8 }}>
+              Cooked{sl.cookedAt ? ` ${new Date(sl.cookedAt).toLocaleDateString(undefined,{month:"short",day:"numeric"})}` : ""} · ingredients deducted from pantry
+            </div>
+          )}
           <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-            {plan[selectedSlot.day][selectedSlot.meal].placeholder ? (
+            {sl.placeholder ? (
               <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={() => removeSlot(selectedSlot.day, selectedSlot.meal)}>Remove</Btn>
+            ) : sl.cooked ? (
+              <Btn small variant="ghost" style={{ color:COLORS.gold, borderColor:COLORS.gold }} onClick={() => uncook(selectedSlot.day, selectedSlot.meal)}>↩ Uncook (restore pantry)</Btn>
             ) : (
               <>
-                <Btn small variant={plan[selectedSlot.day][selectedSlot.meal].locked?"primary":"ghost"} onClick={() => toggleLock(selectedSlot.day, selectedSlot.meal)} style={plan[selectedSlot.day][selectedSlot.meal].locked?{ background:COLORS.lock }:{}}>
-                  {plan[selectedSlot.day][selectedSlot.meal].locked?"🔒 Locked":"🔓 Lock"}
+                <Btn small variant="primary" style={{ background:COLORS.gold }} onClick={() => startCook(selectedSlot.day, selectedSlot.meal)}>🍳 Cook</Btn>
+                <Btn small variant={sl.locked?"primary":"ghost"} onClick={() => toggleLock(selectedSlot.day, selectedSlot.meal)} style={sl.locked?{ background:COLORS.lock }:{}}>
+                  {sl.locked?"🔒 Locked":"🔓 Lock"}
                 </Btn>
                 <Btn small variant="secondary" onClick={() => doRerollSlot(selectedSlot.day, selectedSlot.meal)}>🎲 Reroll</Btn>
                 <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={() => removeSlot(selectedSlot.day, selectedSlot.meal)}>Remove</Btn>
@@ -1109,7 +1255,8 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
             )}
           </div>
         </Card>
-      )}
+        );
+      })()}
 
       {chunkList.length > 0 && <>
         <SectionLabel>Chunk Summary</SectionLabel>
@@ -1147,7 +1294,73 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
           })}
         </div>
       </>}
+
+      {cookModal && (
+        <div onClick={() => setCookModal(null)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"flex-end", justifyContent:"center", zIndex:50 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background:COLORS.bg, borderRadius:"16px 16px 0 0", width:"100%", maxWidth:480, maxHeight:"82vh", overflowY:"auto", padding:"18px 16px max(18px, env(safe-area-inset-bottom))", boxShadow:"0 -4px 24px rgba(0,0,0,0.2)" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
+              <span style={{ fontSize:16, fontWeight:800, color:COLORS.gold }}>🍳 Cook {cookModal.recipe.name}</span>
+              <span style={{ fontSize:18, color:COLORS.textSec, cursor:"pointer" }} onClick={() => setCookModal(null)}>✕</span>
+            </div>
+            <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:14 }}>
+              {cookModal.factor === 1
+                ? "Cooking at recipe scale (no active people set)."
+                : `Scaled ${cookModal.factor.toFixed(2)}× for household demand.`}
+              {" "}Confirm to deduct from pantry.
+            </div>
+
+            {cookModal.tracked.length > 0 && <>
+              <SectionLabel>Deducting from pantry</SectionLabel>
+              <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+                {cookModal.tracked.map((l, i) => (
+                  <div key={i} style={{ display:"flex", alignItems:"center", gap:8, padding:"8px 10px", borderRadius:6, background:COLORS.surface }}>
+                    <span style={{ flex:1, fontSize:13, fontWeight:600 }}>{l.name}</span>
+                    <span style={{ fontSize:12, color:COLORS.red, fontWeight:600 }}>−{l.deduct} {l.unit}</span>
+                    <span style={{ fontSize:11, color:COLORS.textSec }}>{l.have}→{l.after}</span>
+                  </div>
+                ))}
+              </div>
+            </>}
+
+            {cookModal.untracked.length > 0 && <>
+              <SectionLabel>Not tracked</SectionLabel>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                {cookModal.untracked.map((u, i) => (
+                  <span key={i} style={{ fontSize:12, padding:"4px 8px", borderRadius:5, background:"#fff", border:`1px solid ${COLORS.border}`, color:COLORS.textSec }}>
+                    {u.name} <span style={{ fontSize:10 }}>({u.reason})</span>
+                  </span>
+                ))}
+              </div>
+            </>}
+
+            {cookModal.spices.length > 0 && <>
+              <SectionLabel>Spices used — tap to flag low</SectionLabel>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                {cookModal.spices.map((s, i) => (
+                  <SpiceFlagChip key={i} name={s} />
+                ))}
+              </div>
+            </>}
+
+            <div style={{ display:"flex", gap:8, marginTop:18 }}>
+              <Btn style={{ flex:1, background:COLORS.gold }} onClick={() => applyCook(cookModal.day, cookModal.meal, cookModal.recipe, cookModal)}>Confirm & Cook</Btn>
+              <Btn variant="ghost" onClick={() => setCookModal(null)}>Cancel</Btn>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+// Spice chip in the cook modal — taps toggle a "flag low" visual hint.
+// (Wiring spice flags into the shopping list comes with the spice shelf, D.)
+function SpiceFlagChip({ name }) {
+  const [flagged, setFlagged] = useState(false);
+  return (
+    <span onClick={() => setFlagged(f => !f)} style={{ fontSize:12, padding:"4px 8px", borderRadius:5, cursor:"pointer", background:flagged?COLORS.quarantineBg:COLORS.surface, border:`1px solid ${flagged?COLORS.red:COLORS.border}`, color:flagged?COLORS.red:COLORS.text, fontWeight:flagged?600:400 }}>
+      {flagged ? "🔻 " : ""}{name}
+    </span>
   );
 }
 
@@ -1392,25 +1605,117 @@ function PantryTab({ pantry, setPantry }) {
 // ============================================================
 // SETTINGS TAB
 // ============================================================
-function SettingsTab({ settings, setSettings }) {
-  const [section, setSection] = useState("weights");
+function SettingsTab({ settings, setSettings, people, setPeople }) {
+  const [section, setSection] = useState("people");
   const update = (key, val) => setSettings(prev => ({ ...prev, [key]: val }));
 
   return (
     <div>
       <div style={{ display:"flex", gap:4, marginBottom:14, flexWrap:"wrap" }}>
-        {[["weights","Tag Weights"],["targets","Meal Targets"],["ranges","Ranges"],["redlist","Red List"],["excludes","Excludes"],["boosts","Boosts"],["data","Data"]].map(([k, l]) => (
+        {[["people","People"],["weights","Tag Weights"],["targets","Meal Targets"],["ranges","Ranges"],["redlist","Red List"],["excludes","Excludes"],["boosts","Boosts"],["cooking","Cooking"],["data","Data"]].map(([k, l]) => (
           <Btn key={k} small variant={section===k?"primary":"ghost"} onClick={() => setSection(k)}>{l}</Btn>
         ))}
       </div>
 
+      {section === "people" && <PeopleSection people={people} setPeople={setPeople} />}
       {section === "weights" && <TagWeightsSection tagWeights={settings.tagWeights} onChange={v => update("tagWeights", v)} />}
       {section === "targets" && <MealTargetsSection targets={settings.mealTargets} onChange={v => update("mealTargets", v)} />}
       {section === "ranges" && <RangesSection ranges={settings.ranges} onChange={v => update("ranges", v)} tagWeights={settings.tagWeights} />}
       {section === "redlist" && <RedListSection redList={settings.redList} onChange={v => update("redList", v)} />}
       {section === "excludes" && <ExcludesSection excludes={settings.excludes} onChange={v => update("excludes", v)} />}
       {section === "boosts" && <BoostsSection boosts={settings.boosts} onChange={v => update("boosts", v)} />}
+      {section === "cooking" && <CookingSection settings={settings} update={update} />}
       {section === "data" && <DataSection />}
+    </div>
+  );
+}
+
+function PeopleSection({ people, setPeople }) {
+  const [name, setName] = useState("");
+  const [profile, setProfile] = useState("man");
+
+  function addPerson() {
+    if (!name.trim()) return;
+    const pt = PROFILE_TYPES.find(p => p.key === profile) || PROFILE_TYPES[0];
+    setPeople(prev => [...prev, {
+      id: uid(), name: name.trim(), profile: pt.key,
+      weight: pt.weight, attendance: 1.0, active: true,
+    }]);
+    setName("");
+  }
+  function updatePerson(id, patch) { setPeople(prev => prev.map(p => p.id === id ? { ...p, ...patch } : p)); }
+  function removePerson(id) { setPeople(prev => prev.filter(p => p.id !== id)); }
+
+  const demand = portionDemand(people);
+
+  return (
+    <div>
+      <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:10 }}>
+        Who you're cooking for. Recipes scale to total portion demand. With no active people, recipes fall back to their own serving count.
+      </div>
+
+      {people.length > 0 && (
+        <div style={{ display:"flex", flexDirection:"column", gap:6, marginBottom:12 }}>
+          {people.map(p => {
+            const pt = PROFILE_TYPES.find(x => x.key === p.profile);
+            const att = ATTENDANCE.reduce((best, a) => Math.abs(a.factor - p.attendance) < Math.abs(best.factor - p.attendance) ? a : best, ATTENDANCE[0]);
+            return (
+              <Card key={p.id} style={{ opacity: p.active ? 1 : 0.55, padding:"10px 12px" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+                  <div onClick={() => updatePerson(p.id, { active: !p.active })} style={{ width:22, height:22, borderRadius:5, border:`2px solid ${p.active?COLORS.primary:COLORS.border}`, background:p.active?COLORS.primary:"transparent", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", flexShrink:0 }}>
+                    {p.active && <span style={{ color:"#fff", fontSize:13, fontWeight:700 }}>✓</span>}
+                  </div>
+                  <span style={{ fontSize:14, fontWeight:700, flex:1 }}>{p.name}</span>
+                  <span style={{ fontSize:11, color:COLORS.textSec }}>{(p.weight * p.attendance).toFixed(2)} portion</span>
+                  <span style={{ fontSize:14, cursor:"pointer", color:COLORS.red }} onClick={() => removePerson(p.id)}>×</span>
+                </div>
+                <div style={{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center" }}>
+                  <select value={p.profile} onChange={e => { const npt = PROFILE_TYPES.find(x => x.key === e.target.value); updatePerson(p.id, { profile: npt.key, weight: npt.weight }); }} style={{ fontSize:12, padding:"4px 6px", borderRadius:5, border:`1px solid ${COLORS.border}`, background:"#fff" }}>
+                    {PROFILE_TYPES.map(t => <option key={t.key} value={t.key}>{t.label}</option>)}
+                  </select>
+                  <input type="number" step="0.05" value={p.weight} onChange={e => updatePerson(p.id, { weight: Math.max(0, +e.target.value) })} style={{ width:54, fontSize:12, padding:"4px 6px", borderRadius:5, border:`1px solid ${COLORS.border}`, textAlign:"center" }} title="portion weight" />
+                  <select value={att.key} onChange={e => { const na = ATTENDANCE.find(x => x.key === e.target.value); updatePerson(p.id, { attendance: na.factor }); }} style={{ fontSize:12, padding:"4px 6px", borderRadius:5, border:`1px solid ${COLORS.border}`, background:"#fff" }}>
+                    {ATTENDANCE.map(a => <option key={a.key} value={a.key}>{a.label}</option>)}
+                  </select>
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ padding:"10px 12px", borderRadius:8, background:COLORS.boostBg, marginBottom:12, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <span style={{ fontSize:12, fontWeight:600, color:COLORS.boost }}>Total portion demand</span>
+        <span style={{ fontSize:16, fontWeight:800, color:COLORS.boost }}>{demand > 0 ? demand.toFixed(2) : "—"}</span>
+      </div>
+
+      <div style={{ display:"flex", gap:6 }}>
+        <input value={name} onChange={e => setName(e.target.value)} placeholder="Name..." style={{ flex:1, padding:"8px 10px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13 }} />
+        <select value={profile} onChange={e => setProfile(e.target.value)} style={{ fontSize:13, padding:"4px 8px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, background:"#fff" }}>
+          {PROFILE_TYPES.map(t => <option key={t.key} value={t.key}>{t.label}</option>)}
+        </select>
+        <Btn small onClick={addPerson}>Add</Btn>
+      </div>
+    </div>
+  );
+}
+
+function CookingSection({ settings, update }) {
+  const auto = !!settings.autoDecrement;
+  return (
+    <div>
+      <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:10 }}>Cooking behavior</div>
+      <Card style={{ padding:"12px 14px" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div onClick={() => update("autoDecrement", !auto)} style={{ width:44, height:26, borderRadius:13, background:auto?COLORS.primary:COLORS.border, position:"relative", cursor:"pointer", flexShrink:0, transition:"background 0.15s" }}>
+            <div style={{ width:20, height:20, borderRadius:10, background:"#fff", position:"absolute", top:3, left:auto?21:3, transition:"left 0.15s", boxShadow:"0 1px 3px rgba(0,0,0,0.2)" }} />
+          </div>
+          <div style={{ flex:1 }}>
+            <div style={{ fontSize:14, fontWeight:600 }}>Auto-decrement on cook</div>
+            <div style={{ fontSize:11, color:COLORS.textSec }}>{auto ? "Marking cooked deducts ingredients immediately" : "Marking cooked shows a confirm screen first"}</div>
+          </div>
+        </div>
+      </Card>
     </div>
   );
 }
@@ -1610,6 +1915,7 @@ export default function App() {
   const [plan, setPlanRaw] = useState(() => load("plan", emptyPlan()));
   const [settings, setSettingsRaw] = useState(() => load("settings", DEFAULT_SETTINGS));
   const [dictionary, setDictionaryRaw] = useState(() => load("dictionary", []));
+  const [people, setPeopleRaw] = useState(() => load("people", []));
 
   // Persist INSIDE the functional updater so React supplies the true latest
   // state (no stale closure), and we save exactly what we commit. Empty dep
@@ -1629,6 +1935,9 @@ export default function App() {
   const setDictionary = useCallback(v => {
     setDictionaryRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("dictionary", next); return next; });
   }, []);
+  const setPeople = useCallback(v => {
+    setPeopleRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("people", next); return next; });
+  }, []);
 
   return (
     <div style={{ minHeight:"100vh", background:COLORS.bg, fontFamily:'-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', color:COLORS.text, display:"flex", flexDirection:"column" }}>
@@ -1637,10 +1946,10 @@ export default function App() {
       </div>
       <div style={{ flex:1, padding:"12px 16px 90px", overflowY:"auto" }}>
         {tab === "Recipes" && <RecipesTab recipes={recipes} setRecipes={setRecipes} settings={settings} dictionary={dictionary} setDictionary={setDictionary} />}
-        {tab === "Plan" && <PlanTab recipes={recipes} setRecipes={setRecipes} plan={plan} setPlan={setPlan} settings={settings} />}
+        {tab === "Plan" && <PlanTab recipes={recipes} setRecipes={setRecipes} plan={plan} setPlan={setPlan} settings={settings} pantry={pantry} setPantry={setPantry} people={people} />}
         {tab === "Shop" && <ShopTab plan={plan} recipes={recipes} pantry={pantry} />}
         {tab === "Pantry" && <PantryTab pantry={pantry} setPantry={setPantry} />}
-        {tab === "Settings" && <SettingsTab settings={settings} setSettings={setSettings} />}
+        {tab === "Settings" && <SettingsTab settings={settings} setSettings={setSettings} people={people} setPeople={setPeople} />}
       </div>
       <div style={{ position:"fixed", bottom:0, left:0, right:0, display:"flex", justifyContent:"space-around", padding:"8px 0 max(12px, env(safe-area-inset-bottom))", background:COLORS.bg, borderTop:`1px solid ${COLORS.border}`, zIndex:20 }}>
         {TABS.map(t => (
