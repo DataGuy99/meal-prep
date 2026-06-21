@@ -511,16 +511,23 @@ function prettyUnit(family, baseQty) {
 
 function round1(n) { return Math.round(n * 10) / 10; }
 
-function generateShoppingList(plan, recipes, pantry) {
+function generateShoppingList(plan, recipes, pantry, excludes = [], activePersonIds = null, maxOmissions = Infinity) {
   // Bucket needs by ingredient name + unit family. Within a family, sum in base units.
   // needs[name] = { name, category, families: { [family]: baseQty } }
   const needs = {};
+  const now = Date.now();
   DAYS.forEach(d => MEALS.forEach(m => {
     const slot = plan?.[d]?.[m];
     if (!slot?.recipeId) return;
     const recipe = recipes.find(r => r.id === slot.recipeId);
     if (!recipe) return;
+    // Omission (M): ingredients dropped for the active household shouldn't be
+    // bought. A qualifying recipe's omitted secondary ingredients are excluded
+    // from the shopping list.
+    const qual = qualifyRecipe(recipe, excludes, activePersonIds, now, maxOmissions);
+    const omittedSet = new Set(qual.omitted.map(n => normalize(n)));
     for (const ing of recipe.ingredients) {
+      if (omittedSet.has(normalize(ing.name))) continue;
       const key = normalize(ing.name);
       if (!needs[key]) needs[key] = { name: ing.name, category: guessCategory(ing.name), families: {} };
       const info = unitInfo(ing.unit);
@@ -576,9 +583,9 @@ function getFloorItems(pantry) {
 // sum — buying enough for the larger need covers the smaller. This is what
 // prevents the floor double-add (an item that's both plan-needed and below
 // floor appears once). Manual items are passed through untouched.
-function buildUnifiedList(plan, recipes, pantry) {
+function buildUnifiedList(plan, recipes, pantry, excludes = [], activePersonIds = null, maxOmissions = Infinity) {
   // Collect plan needs in base units per (name, family).
-  const planItems = generateShoppingList(plan, recipes, pantry);
+  const planItems = generateShoppingList(plan, recipes, pantry, excludes, activePersonIds, maxOmissions);
   const floorItems = getFloorItems(pantry);
 
   // Key each by name|family. For floor items, derive their family from unit.
@@ -1494,7 +1501,15 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
 // ============================================================
 // SHOP TAB
 // ============================================================
-function ShopTab({ plan, recipes, pantry, setPantry, spices, setSpices }) {
+function ShopTab({ plan, recipes, pantry, setPantry, spices, setSpices, settings, people }) {
+  // Active eater ids for scope-aware omission (M). Null when roster empty/all
+  // inactive, so person-scoped restrictions don't omit anything.
+  const activeIds = (() => {
+    const ids = new Set((people || []).filter(p => p.active).map(p => p.id));
+    return ids.size > 0 ? ids : null;
+  })();
+  const excludes = settings?.excludes || [];
+  const maxOmissions = settings?.maxOmissions ?? Infinity;
   const [shopItems, setShopItems] = useState([]);
   const [groupBy, setGroupBy] = useState("category");
   const [manualName, setManualName] = useState("");
@@ -1505,7 +1520,7 @@ function ShopTab({ plan, recipes, pantry, setPantry, spices, setSpices }) {
   function doGenerate() {
     // Preserve any manual items the user added, re-merge with fresh plan+floor.
     const manual = shopItems.filter(i => i.source === "manual");
-    const unified = buildUnifiedList(plan, recipes, pantry);
+    const unified = buildUnifiedList(plan, recipes, pantry, excludes, activeIds, maxOmissions);
     // Merge manual items in, deduped by name+family against the unified list.
     const byKey = {};
     const keyOf = (name, unit) => `${normalize(name)}|${unitInfo(unit).family}`;
@@ -2257,7 +2272,7 @@ export default function App() {
       <div style={{ flex:1, padding:"12px 16px 90px", overflowY:"auto" }}>
         {tab === "Recipes" && <RecipesTab recipes={recipes} setRecipes={setRecipes} settings={settings} dictionary={dictionary} setDictionary={setDictionary} />}
         {tab === "Plan" && <PlanTab recipes={recipes} setRecipes={setRecipes} plan={plan} setPlan={setPlan} settings={settings} pantry={pantry} setPantry={setPantry} people={people} spices={spices} setSpices={setSpices} />}
-        {tab === "Shop" && <ShopTab plan={plan} recipes={recipes} pantry={pantry} setPantry={setPantry} spices={spices} setSpices={setSpices} />}
+        {tab === "Shop" && <ShopTab plan={plan} recipes={recipes} pantry={pantry} setPantry={setPantry} spices={spices} setSpices={setSpices} settings={settings} people={people} />}
         {tab === "Pantry" && <PantryTab pantry={pantry} setPantry={setPantry} spices={spices} setSpices={setSpices} />}
         {tab === "Settings" && <SettingsTab settings={settings} setSettings={setSettings} people={people} setPeople={setPeople} />}
       </div>
