@@ -115,6 +115,32 @@ function excludeApplies(ex, activePersonIds) {
   return activePersonIds.has(ex.scope);
 }
 
+// Qualification engine (K). Given a recipe and the active+applicable excludes,
+// decide whether it can be made and what gets left out:
+//   - excluded ingredient on an ESSENTIAL tier  -> recipe DISQUALIFIED
+//   - excluded ingredient on SECONDARY tier only -> recipe QUALIFIES, omit it
+// Legacy untiered ingredients are treated as essential (nothing silently
+// becomes omittable). Returns { qualified, omitted:[names], blockedBy:[{ingredient,scope}] }.
+function qualifyRecipe(recipe, excludes, activePersonIds, now = Date.now()) {
+  const omitted = [];
+  const blockedBy = [];
+  for (const ex of excludes) {
+    if (!excludeActive(ex, now)) continue;
+    if (!excludeApplies(ex, activePersonIds)) continue;
+    const exName = normalize(ex.ingredient);
+    for (const ing of recipe.ingredients) {
+      if (normalize(ing.name) !== exName) continue;
+      const tier = ing.tier || "essential";
+      if (tier === "essential") {
+        blockedBy.push({ ingredient: ing.name, scope: ex.scope || "all" });
+      } else {
+        if (!omitted.includes(ing.name)) omitted.push(ing.name);
+      }
+    }
+  }
+  return { qualified: blockedBy.length === 0, omitted, blockedBy };
+}
+
 function normalize(s) {
   let w = s.toLowerCase().trim().replace(/-/g, " ").replace(/\s+/g, " ");
   if (!w) return w;
@@ -232,17 +258,11 @@ function trimHistory(hist) {
   return hist.filter(t => t >= cutoff);
 }
 
-function calcWeight(recipe, settings, planTagCounts) {
+function calcWeight(recipe, settings, planTagCounts, activePersonIds = null) {
   const { tagWeights, boosts, excludes, ranges } = settings;
   const now = Date.now();
-  // Hard exclude check
-  for (const ex of excludes) {
-    if (excludeActive(ex)) {
-      for (const ing of recipe.ingredients) {
-        if (normalize(ing.name) === normalize(ex.ingredient)) return 0;
-      }
-    }
-  }
+  // Qualification: essential exclusion disqualifies (weight 0).
+  if (!qualifyRecipe(recipe, excludes, activePersonIds, now).qualified) return 0;
   if (recipe.quarantine) return 0;
 
   let starW = (recipe.stars || 3) / 5;
@@ -289,7 +309,7 @@ function calcWeight(recipe, settings, planTagCounts) {
   return starW * (1 + tagW) * fatigue * boostMul * rangeMul;
 }
 
-function generatePlan(recipes, existingPlan, settings) {
+function generatePlan(recipes, existingPlan, settings, activePersonIds = null) {
   const plan = {};
   DAYS.forEach(d => {
     plan[d] = {};
@@ -303,13 +323,8 @@ function generatePlan(recipes, existingPlan, settings) {
   const now = Date.now();
   const eligible = recipes.filter(r => {
     if (r.quarantine) return false;
-    for (const ex of excludes) {
-      if (excludeActive(ex)) {
-        for (const ing of r.ingredients) {
-          if (normalize(ing.name) === normalize(ex.ingredient)) return false;
-        }
-      }
-    }
+    // Qualification engine: essential exclusion disqualifies; secondary omits.
+    if (!qualifyRecipe(r, excludes, activePersonIds, now).qualified) return false;
     for (const rl of redList) {
       for (const ing of r.ingredients) {
         if (normalize(ing.name) === normalize(rl)) return false;
@@ -363,8 +378,8 @@ function generatePlan(recipes, existingPlan, settings) {
       attempts++;
       const weights = pool.map(r => {
         let base = usedRecipes.has(r.id)
-          ? calcWeight(r, settings, tagCounts) * 0.3
-          : calcWeight(r, settings, tagCounts);
+          ? calcWeight(r, settings, tagCounts, activePersonIds) * 0.3
+          : calcWeight(r, settings, tagCounts, activePersonIds);
         // Soft meal-target bias
         if (band && base > 0) {
           const score = tagScoreOf(r);
@@ -420,7 +435,7 @@ function generatePlan(recipes, existingPlan, settings) {
   return plan;
 }
 
-function rerollSlot(day, meal, recipes, plan, settings) {
+function rerollSlot(day, meal, recipes, plan, settings, activePersonIds = null) {
   const mealKey = meal.toLowerCase();
   const now = Date.now();
   const currentRecipeId = plan[day]?.[meal]?.recipeId;
@@ -428,18 +443,12 @@ function rerollSlot(day, meal, recipes, plan, settings) {
   const eligible = recipes.filter(r => {
     if (r.quarantine || r.id === currentRecipeId) return false;
     if (!(r.mealTags || []).includes(mealKey)) return false;
-    for (const ex of settings.excludes) {
-      if (excludeActive(ex)) {
-        for (const ing of r.ingredients) {
-          if (normalize(ing.name) === normalize(ex.ingredient)) return false;
-        }
-      }
-    }
+    if (!qualifyRecipe(r, settings.excludes, activePersonIds, now).qualified) return false;
     return true;
   });
 
   if (eligible.length === 0) return plan;
-  const weights = eligible.map(r => ({ r, w: calcWeight(r, settings, {}) })).filter(x => x.w > 0);
+  const weights = eligible.map(r => ({ r, w: calcWeight(r, settings, {}, activePersonIds) })).filter(x => x.w > 0);
   if (weights.length === 0) return plan;
 
   const totalW = weights.reduce((s, x) => s + x.w, 0);
@@ -950,6 +959,14 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
     return demand / base;
   };
 
+  // Active eater ids — drives scope-aware qualification. Null when roster is
+  // empty/all-inactive, so person-scoped restrictions are ignored (no one to
+  // restrict for); "all"-scoped restrictions still always apply.
+  const activeIds = (() => {
+    const ids = new Set((people || []).filter(p => p.active).map(p => p.id));
+    return ids.size > 0 ? ids : null;
+  })();
+
   // Build the consumption breakdown for a recipe at the current scale.
   function buildCookLines(recipe) {
     const factor = scaleFor(recipe);
@@ -1041,7 +1058,7 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
   }
 
   function doGenerate() {
-    const newPlan = generatePlan(recipes, plan, settings);
+    const newPlan = generatePlan(recipes, plan, settings, activeIds);
     setPlan(newPlan);
     // Count uses by SLOTS FILLED, not per-generation. A recipe occupying
     // 5 slots logs 5 timestamps so the frequency layer reflects real load.
@@ -1065,12 +1082,12 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
   }
 
   function doRerollUnlocked() {
-    const newPlan = generatePlan(recipes, plan, settings);
+    const newPlan = generatePlan(recipes, plan, settings, activeIds);
     setPlan(newPlan);
   }
 
   function doRerollSlot(day, meal) {
-    const newPlan = rerollSlot(day, meal, recipes, plan, settings);
+    const newPlan = rerollSlot(day, meal, recipes, plan, settings, activeIds);
     setPlan(newPlan);
   }
 
@@ -1118,7 +1135,7 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
   }
 
   function autofillBlanks() {
-    const newPlan = generatePlan(recipes, plan, settings);
+    const newPlan = generatePlan(recipes, plan, settings, activeIds);
     // Merge: keep all existing assignments, fill only nulls
     const merged = JSON.parse(JSON.stringify(plan));
     DAYS.forEach(d => MEALS.forEach(m => {
@@ -1240,19 +1257,14 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
         const eligible = recipes.filter(r => {
           if (r.quarantine) return false;
           if (!(r.mealTags || []).includes(mealKey)) return false;
-          for (const ex of settings.excludes) {
-            if (excludeActive(ex)) {
-              for (const ing of r.ingredients) {
-                if (normalize(ing.name) === normalize(ex.ingredient)) return false;
-              }
-            }
-          }
           if (pickerSearch) {
             const q = pickerSearch.toLowerCase();
             if (!r.name.toLowerCase().includes(q) && !(r.tags||[]).some(t => t.includes(q))) return false;
           }
           return true;
-        }).sort((a, b) => (b.stars || 0) - (a.stars || 0));
+        }).map(r => ({ r, qual: qualifyRecipe(r, settings.excludes, activeIds, now) }))
+          // Qualified first, then by stars.
+          .sort((a, b) => (b.qual.qualified - a.qual.qualified) || ((b.r.stars || 0) - (a.r.stars || 0)));
 
         return (
           <Card style={{ marginTop:10, border:`2px solid ${mealColor.fg}`, maxHeight:320, display:"flex", flexDirection:"column" }}>
@@ -1281,17 +1293,29 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
                   No {mealKey}-tagged recipes{pickerSearch ? " matching search" : ""}
                 </div>
               )}
-              {eligible.map(r => (
+              {eligible.map(({ r, qual }) => (
                 <div key={r.id} onClick={() => assignRecipe(pickerSlot.day, pickerSlot.meal, r)} style={{
                   display:"flex", alignItems:"center", gap:10, padding:"8px 10px", borderRadius:6,
-                  background:mealColor.bg, border:`1px solid ${mealColor.fg}25`, cursor:"pointer",
+                  background:qual.qualified ? mealColor.bg : COLORS.quarantineBg,
+                  border:`1px solid ${qual.qualified ? `${mealColor.fg}25` : `${COLORS.quarantine}40`}`,
+                  cursor:"pointer", opacity:qual.qualified ? 1 : 0.85,
                 }}>
                   <div style={{ flex:1, minWidth:0 }}>
-                    <div style={{ fontSize:13, fontWeight:600, color:mealColor.fg }}>{r.name}</div>
-                    <div style={{ display:"flex", gap:4, marginTop:2, flexWrap:"wrap" }}>
+                    <div style={{ fontSize:13, fontWeight:600, color:qual.qualified ? mealColor.fg : COLORS.quarantine }}>{r.name}</div>
+                    <div style={{ display:"flex", gap:4, marginTop:2, flexWrap:"wrap", alignItems:"center" }}>
                       {(r.tags||[]).map(t => <Badge key={t} color={COLORS.primary} bg={`${COLORS.primary}15`} style={{ fontSize:9, padding:"1px 5px" }}>{t}</Badge>)}
-                      <span style={{ fontSize:10, color:COLORS.textSec }}>{r.servings} srv · {r.slotsMin}–{r.slotsMax} slots</span>
+                      <span style={{ fontSize:10, color:COLORS.textSec }}>{r.servings} srv</span>
                     </div>
+                    {!qual.qualified && (
+                      <div style={{ fontSize:9, color:COLORS.quarantine, marginTop:2 }}>
+                        ⚠ contains {qual.blockedBy.map(b => b.ingredient).join(", ")} (essential)
+                      </div>
+                    )}
+                    {qual.qualified && qual.omitted.length > 0 && (
+                      <div style={{ fontSize:9, color:COLORS.boost, marginTop:2 }}>
+                        omits {qual.omitted.join(", ")}
+                      </div>
+                    )}
                   </div>
                   <div style={{ flexShrink:0, display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
                     <StarRating rating={r.stars} size={11} />
