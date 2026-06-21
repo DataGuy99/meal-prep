@@ -857,6 +857,19 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
     setPickerSearch("");
   }
 
+  function assignPlaceholder(day, meal) {
+    setPlan(prev => {
+      const next = JSON.parse(JSON.stringify(prev));
+      if (!next[day]) next[day] = {};
+      // Placeholder: occupies the slot (so it's not flagged empty) but carries
+      // no recipeId — skipped by generator, shopping list, and fatigue.
+      next[day][meal] = { placeholder: true, recipeName: "No-Cook Meal", locked: true };
+      return next;
+    });
+    setPickerSlot(null);
+    setPickerSearch("");
+  }
+
   function autofillBlanks() {
     const newPlan = generatePlan(recipes, plan, settings);
     // Merge: keep all existing assignments, fill only nulls
@@ -926,10 +939,18 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
                   return (
                     <td key={m} style={{ padding:2, verticalAlign:"top" }}>
                       {slot ? (
-                        <div onClick={() => { setSelectedSlot({ day:d, meal:m }); setPickerSlot(null); }} style={{ background:MC[m].bg, border:`1.5px solid ${isSel?MC[m].fg:`${MC[m].fg}40`}`, borderRadius:6, padding:"4px 6px", minHeight:36, position:"relative", cursor:"pointer" }}>
-                          {slot.locked && <span style={{ position:"absolute", top:2, right:3, fontSize:9, color:COLORS.lock }}>🔒</span>}
-                          <div style={{ fontSize:11, fontWeight:600, color:MC[m].fg, lineHeight:1.2, paddingRight:slot.locked?14:0 }}>{slot.recipeName}</div>
-                          <div style={{ fontSize:9, color:COLORS.textSec, marginTop:1 }}>{slot.chunk}</div>
+                        <div onClick={() => { setSelectedSlot({ day:d, meal:m }); setPickerSlot(null); }} style={{ background:slot.placeholder?COLORS.surface:MC[m].bg, border:`1.5px ${slot.placeholder?"dashed":"solid"} ${isSel?(slot.placeholder?COLORS.textSec:MC[m].fg):(slot.placeholder?COLORS.border:`${MC[m].fg}40`)}`, borderRadius:6, padding:"4px 6px", minHeight:36, position:"relative", cursor:"pointer" }}>
+                          {slot.locked && !slot.placeholder && <span style={{ position:"absolute", top:2, right:3, fontSize:9, color:COLORS.lock }}>🔒</span>}
+                          {slot.placeholder ? (
+                            <div style={{ fontSize:11, fontWeight:600, color:COLORS.textSec, lineHeight:1.2, display:"flex", alignItems:"center", gap:3 }}>
+                              <span style={{ fontSize:10 }}>🍽️</span> {slot.recipeName}
+                            </div>
+                          ) : (
+                            <>
+                              <div style={{ fontSize:11, fontWeight:600, color:MC[m].fg, lineHeight:1.2, paddingRight:slot.locked?14:0 }}>{slot.recipeName}</div>
+                              <div style={{ fontSize:9, color:COLORS.textSec, marginTop:1 }}>{slot.chunk}</div>
+                            </>
+                          )}
                         </div>
                       ) : (
                         <div onClick={() => { setPickerSlot({ day:d, meal:m }); setSelectedSlot(null); setPickerSearch(""); }} style={{ border:`1.5px dashed ${(pickerSlot?.day===d && pickerSlot?.meal===m)?MC[m].fg:COLORS.border}`, borderRadius:6, padding:"5px 6px", minHeight:36, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer" }}>
@@ -978,6 +999,16 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
               style={{ padding:"7px 10px", borderRadius:6, border:`1.5px solid ${mealColor.fg}40`, fontSize:13, marginBottom:8, outline:"none" }}
             />
             <div style={{ flex:1, overflowY:"auto", display:"flex", flexDirection:"column", gap:4 }}>
+              <div onClick={() => assignPlaceholder(pickerSlot.day, pickerSlot.meal)} style={{
+                display:"flex", alignItems:"center", gap:10, padding:"8px 10px", borderRadius:6,
+                background:COLORS.surface, border:`1px dashed ${COLORS.textSec}50`, cursor:"pointer",
+              }}>
+                <span style={{ fontSize:14 }}>🍽️</span>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:13, fontWeight:600, color:COLORS.textSec }}>No-Cook Meal</div>
+                  <div style={{ fontSize:10, color:COLORS.textSec }}>Eat out, leftovers, skip — no recipe, no shopping</div>
+                </div>
+              </div>
               {eligible.length === 0 && (
                 <div style={{ padding:16, textAlign:"center", fontSize:13, color:COLORS.textSec }}>
                   No {mealKey}-tagged recipes{pickerSearch ? " matching search" : ""}
@@ -1009,17 +1040,23 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
       })()}
 
       {selectedSlot && plan?.[selectedSlot.day]?.[selectedSlot.meal] && (
-        <Card style={{ marginTop:10, border:`2px solid ${MC[selectedSlot.meal].fg}` }}>
+        <Card style={{ marginTop:10, border:`2px solid ${plan[selectedSlot.day][selectedSlot.meal].placeholder ? COLORS.textSec : MC[selectedSlot.meal].fg}` }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
             <span style={{ fontSize:13, fontWeight:700 }}>{selectedSlot.day} {selectedSlot.meal}: {plan[selectedSlot.day][selectedSlot.meal].recipeName}</span>
             <span style={{ fontSize:11, color:COLORS.textSec, cursor:"pointer" }} onClick={() => setSelectedSlot(null)}>✕</span>
           </div>
           <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-            <Btn small variant={plan[selectedSlot.day][selectedSlot.meal].locked?"primary":"ghost"} onClick={() => toggleLock(selectedSlot.day, selectedSlot.meal)} style={plan[selectedSlot.day][selectedSlot.meal].locked?{ background:COLORS.lock }:{}}>
-              {plan[selectedSlot.day][selectedSlot.meal].locked?"🔒 Locked":"🔓 Lock"}
-            </Btn>
-            <Btn small variant="secondary" onClick={() => doRerollSlot(selectedSlot.day, selectedSlot.meal)}>🎲 Reroll</Btn>
-            <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={() => removeSlot(selectedSlot.day, selectedSlot.meal)}>Remove</Btn>
+            {plan[selectedSlot.day][selectedSlot.meal].placeholder ? (
+              <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={() => removeSlot(selectedSlot.day, selectedSlot.meal)}>Remove</Btn>
+            ) : (
+              <>
+                <Btn small variant={plan[selectedSlot.day][selectedSlot.meal].locked?"primary":"ghost"} onClick={() => toggleLock(selectedSlot.day, selectedSlot.meal)} style={plan[selectedSlot.day][selectedSlot.meal].locked?{ background:COLORS.lock }:{}}>
+                  {plan[selectedSlot.day][selectedSlot.meal].locked?"🔒 Locked":"🔓 Lock"}
+                </Btn>
+                <Btn small variant="secondary" onClick={() => doRerollSlot(selectedSlot.day, selectedSlot.meal)}>🎲 Reroll</Btn>
+                <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={() => removeSlot(selectedSlot.day, selectedSlot.meal)}>Remove</Btn>
+              </>
+            )}
           </div>
         </Card>
       )}
