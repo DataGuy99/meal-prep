@@ -111,10 +111,54 @@ function guessCategory(name) {
 // ============================================================
 // RANDOMIZATION ENGINE
 // ============================================================
-function calcFatigueRecency(recipe) {
+// ============================================================
+// FATIGUE — TWO LAYERS
+// Layer 1 (recency): time-decay since last use. Short-term pull-down
+//   that recovers over days.
+// Layer 2 (frequency): count of uses within a trailing window, derived
+//   from useHistory timestamps. Long-term pull-down against a recipe
+//   resurfacing too often even when each individual recency check passes.
+// A manual "shelve" sets shelvedUntil for an explicit extended back-burner.
+// ============================================================
+const FREQ_WINDOW_DAYS = 30;   // rolling window for frequency counting
+const FREQ_SOFT_CAP = 6;       // uses in-window beyond which weight tapers hard
+const FREQ_PROMPT_AT = 8;      // uses in-window that trigger the "take a break?" nudge
+const HISTORY_KEEP_DAYS = 90;  // trim useHistory older than this
+
+function recencyFactor(recipe) {
   if (!recipe.lastUsed) return 1;
   const days = (Date.now() - recipe.lastUsed) / 86400000;
   return 1 - Math.exp(-days / 3);
+}
+
+function windowedUseCount(recipe, windowDays = FREQ_WINDOW_DAYS) {
+  if (!recipe.useHistory || recipe.useHistory.length === 0) return 0;
+  const cutoff = Date.now() - windowDays * 86400000;
+  return recipe.useHistory.filter(t => t >= cutoff).length;
+}
+
+function frequencyFactor(recipe) {
+  const n = windowedUseCount(recipe);
+  if (n <= FREQ_SOFT_CAP) return 1;
+  // Beyond the soft cap, decay toward (but never reaching) zero.
+  return Math.max(0.05, 1 - (n - FREQ_SOFT_CAP) * 0.18);
+}
+
+// Combined fatigue multiplier in [0,1]. Used by the weighting engine.
+function calcFatigue(recipe) {
+  // Explicit manual shelf overrides everything until it expires.
+  if (recipe.shelvedUntil && recipe.shelvedUntil > Date.now()) return 0.05;
+  return recencyFactor(recipe) * frequencyFactor(recipe);
+}
+
+// Back-compat shim: older call sites referenced calcFatigueRecency.
+const calcFatigueRecency = calcFatigue;
+
+// Trim history to keep storage bounded.
+function trimHistory(hist) {
+  if (!hist) return [];
+  const cutoff = Date.now() - HISTORY_KEEP_DAYS * 86400000;
+  return hist.filter(t => t >= cutoff);
 }
 
 function calcWeight(recipe, settings, planTagCounts) {
@@ -493,10 +537,15 @@ function RecipesTab({ recipes, setRecipes, settings, dictionary, setDictionary }
     return true;
   });
 
-  const freqNotifs = recipes.filter(r => r.useCount >= 8 && calcFatigueRecency(r) > 0.6).map(r => ({
-    icon: "🔔", text: `${r.name} picked ${r.useCount}× recently. Take a break?`,
+  const freqNotifs = recipes.filter(r => {
+    if (r.shelvedUntil && r.shelvedUntil > Date.now()) return false;
+    return windowedUseCount(r) >= FREQ_PROMPT_AT;
+  }).map(r => ({
+    icon: "🔔", text: `${r.name} used ${windowedUseCount(r)}× in the last ${FREQ_WINDOW_DAYS} days. Take a break?`,
     bg: "#FFF3CD", color: "#856404", action: "Shelve",
-    onAction: () => setRecipes(prev => prev.map(x => x.id === r.id ? { ...x, lastUsed: Date.now(), useCount: 0 } : x)),
+    onAction: () => setRecipes(prev => prev.map(x => x.id === r.id
+      ? { ...x, shelvedUntil: Date.now() + 14 * 86400000 }
+      : x)),
   }));
   const quarNotifs = recipes.filter(r => r.quarantine).map(r => ({
     icon: "🔴", text: `${r.name} has unresolved red-list items`,
@@ -519,7 +568,7 @@ function RecipesTab({ recipes, setRecipes, settings, dictionary, setDictionary }
       servings: addForm.servings, slotsMin: addForm.slotsMin, slotsMax: addForm.slotsMax,
       ingredients: newIngs, quarantine: isQ,
       quarantineItems: redHits.map(r => ({ ingredient: r.name, sub: "" })),
-      lastUsed: null, useCount: 0, useHistory: [], createdAt: Date.now(),
+      lastUsed: null, useCount: 0, useHistory: [], shelvedUntil: null, createdAt: Date.now(),
     };
     setRecipes(prev => [...prev, recipe]);
     setAddForm({ name:"", tags:[], mealTags:[], servings:4, slotsMin:2, slotsMax:4, stars:3, ingredientText:"" });
@@ -559,12 +608,13 @@ function RecipesTab({ recipes, setRecipes, settings, dictionary, setDictionary }
                 <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
                   <span style={{ fontSize:15, fontWeight:700 }}>{r.name}</span>
                   {r.quarantine && <Badge color={COLORS.quarantine} bg={COLORS.quarantineBg}>Quarantined</Badge>}
+                  {r.shelvedUntil && r.shelvedUntil > Date.now() && <Badge color={COLORS.lock} bg={COLORS.surface}>💤 Shelved</Badge>}
                 </div>
                 <div style={{ display:"flex", gap:4, marginTop:4, flexWrap:"wrap" }}>
                   {(r.tags||[]).map(t => <Badge key={t} color={COLORS.primary} bg={`${COLORS.primary}18`}>{t}</Badge>)}
                   {(r.mealTags||[]).map(t => <Badge key={t} color={MC[t.charAt(0).toUpperCase()+t.slice(1)]?.fg||COLORS.textSec} bg={MC[t.charAt(0).toUpperCase()+t.slice(1)]?.bg||COLORS.surface}>{t}</Badge>)}
                 </div>
-                <div style={{ fontSize:11, color:COLORS.textSec, marginTop:3 }}>{r.servings} servings · {r.slotsMin}–{r.slotsMax} slots · Used {r.useCount||0}×</div>
+                <div style={{ fontSize:11, color:COLORS.textSec, marginTop:3 }}>{r.servings} servings · {r.slotsMin}–{r.slotsMax} slots · {windowedUseCount(r)}× in {FREQ_WINDOW_DAYS}d</div>
               </div>
               <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4, flexShrink:0 }}>
                 <StarRating rating={r.stars} size={14} onChange={v => updateRecipe(r.id, { stars: v })} />
@@ -611,7 +661,12 @@ function RecipesTab({ recipes, setRecipes, settings, dictionary, setDictionary }
                     ))}
                   </div>
                 )}
-                <div style={{ marginTop:8 }}>
+                <div style={{ marginTop:8, display:"flex", gap:6, flexWrap:"wrap" }}>
+                  {r.shelvedUntil && r.shelvedUntil > Date.now() && (
+                    <Btn small variant="ghost" style={{ color:COLORS.lock, borderColor:COLORS.lock }} onClick={() => updateRecipe(r.id, { shelvedUntil: null })}>
+                      💤 Unshelve ({Math.ceil((r.shelvedUntil - Date.now())/86400000)}d left)
+                    </Btn>
+                  )}
                   <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={() => deleteRecipe(r.id)}>Delete recipe</Btn>
                 </div>
               </div>
@@ -689,10 +744,25 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings }) {
   function doGenerate() {
     const newPlan = generatePlan(recipes, plan, settings);
     setPlan(newPlan);
-    // Update usage stats
-    const usedIds = new Set();
-    DAYS.forEach(d => MEALS.forEach(m => { if (newPlan[d]?.[m]?.recipeId) usedIds.add(newPlan[d][m].recipeId); }));
-    setRecipes(prev => prev.map(r => usedIds.has(r.id) ? { ...r, lastUsed: Date.now(), useCount: (r.useCount||0) + 1, useHistory: [...(r.useHistory||[]), Date.now()] } : r));
+    // Count uses by SLOTS FILLED, not per-generation. A recipe occupying
+    // 5 slots logs 5 timestamps so the frequency layer reflects real load.
+    const slotCounts = {};
+    DAYS.forEach(d => MEALS.forEach(m => {
+      const id = newPlan[d]?.[m]?.recipeId;
+      if (id) slotCounts[id] = (slotCounts[id] || 0) + 1;
+    }));
+    const now = Date.now();
+    setRecipes(prev => prev.map(r => {
+      const added = slotCounts[r.id];
+      if (!added) return r;
+      const stamps = Array(added).fill(now);
+      return {
+        ...r,
+        lastUsed: now,
+        useCount: (r.useCount || 0) + added,
+        useHistory: trimHistory([...(r.useHistory || []), ...stamps]),
+      };
+    }));
   }
 
   function doRerollUnlocked() {
