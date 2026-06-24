@@ -126,11 +126,18 @@ function dedupeById(arr) {
 // Contains a render crash to a single card instead of white-screening the whole
 // app. If a child throws, shows a small recoverable notice with the fallback.
 class ErrorBoundary extends Component {
-  constructor(props) { super(props); this.state = { failed: false }; }
-  static getDerivedStateFromError() { return { failed: true }; }
-  componentDidCatch() { /* swallow; the boundary UI handles it */ }
+  constructor(props) { super(props); this.state = { failed: false, msg: "" }; }
+  static getDerivedStateFromError(error) { return { failed: true, msg: error?.message || String(error) }; }
+  componentDidCatch(error, info) {
+    // Keep the real reason available for diagnosis instead of swallowing it.
+    try { console.error("Recipe card crash:", error, info); } catch {}
+  }
   render() {
-    if (this.state.failed) return this.props.fallback || null;
+    if (this.state.failed) {
+      return typeof this.props.fallback === "function"
+        ? this.props.fallback(this.state.msg)
+        : (this.props.fallback || null);
+    }
     return this.props.children;
   }
 }
@@ -1358,14 +1365,17 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
       )}
       {(() => {
         const renderCard = (r) => (
-          <ErrorBoundary key={r.id} fallback={
+          <ErrorBoundary key={r.id} fallback={(msg) => (
             <Card>
-              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                <span style={{ fontSize:13, color:COLORS.quarantine }}>⚠ This recipe couldn't be displayed{r.name ? `: "${r.name}"` : ""}.</span>
-                <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={() => deleteRecipe(r.id)}>Delete</Btn>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8 }}>
+                <div style={{ minWidth:0 }}>
+                  <div style={{ fontSize:13, fontWeight:600, color:COLORS.quarantine }}>⚠ Couldn't display{r.name ? `: "${r.name}"` : " this recipe"}</div>
+                  {msg && <div style={{ fontSize:10, color:COLORS.textSec, marginTop:3, wordBreak:"break-word" }}>{msg}</div>}
+                </div>
+                <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red, flexShrink:0 }} onClick={() => deleteRecipe(r.id)}>Delete</Btn>
               </div>
             </Card>
-          }>
+          )}>
           <Card onClick={() => setExpandedId(expandedId===r.id?null:r.id)}>
             <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
               <div style={{ flex:1, minWidth:0 }}>
