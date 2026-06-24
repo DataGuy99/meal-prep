@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo, Component } from "react";
 
 // ============================================================
 // CONSTANTS
@@ -89,6 +89,33 @@ function save(key, val) {
   }
 }
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+// Heal arrays with duplicate or missing ids: the first occurrence of an id is
+// kept; any later collision gets a fresh id (data preserved, not dropped). A
+// duplicate id is what crashes React's keyed render — this prevents that.
+function dedupeById(arr) {
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set();
+  return arr.map(item => {
+    if (!item || typeof item !== "object") return item;
+    let id = item.id;
+    if (id == null || seen.has(id)) id = uid();
+    seen.add(id);
+    return id === item.id ? item : { ...item, id };
+  });
+}
+
+// Contains a render crash to a single card instead of white-screening the whole
+// app. If a child throws, shows a small recoverable notice with the fallback.
+class ErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { failed: false }; }
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch() { /* swallow; the boundary UI handles it */ }
+  render() {
+    if (this.state.failed) return this.props.fallback || null;
+    return this.props.children;
+  }
+}
 
 // ============================================================
 // INGREDIENT NORMALIZATION
@@ -1276,7 +1303,15 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
       )}
       {(() => {
         const renderCard = (r) => (
-          <Card key={r.id} onClick={() => setExpandedId(expandedId===r.id?null:r.id)}>
+          <ErrorBoundary key={r.id} fallback={
+            <Card>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <span style={{ fontSize:13, color:COLORS.quarantine }}>⚠ This recipe couldn't be displayed{r.name ? `: "${r.name}"` : ""}.</span>
+                <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={() => deleteRecipe(r.id)}>Delete</Btn>
+              </div>
+            </Card>
+          }>
+          <Card onClick={() => setExpandedId(expandedId===r.id?null:r.id)}>
             <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
               <div style={{ flex:1, minWidth:0 }}>
                 <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
@@ -1389,6 +1424,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
               </div>
             )}
           </Card>
+          </ErrorBoundary>
         );
         if (filtered.length === 0 && recipes.length > 0) {
           return <div style={{ textAlign:"center", padding:"24px 20px", fontSize:13, color:COLORS.textSec }}>No recipes match{search ? ` "${search}"` : ""}.</div>;
@@ -3293,8 +3329,8 @@ function FirstRunSurvey({ settings, setSettings, onClose }) {
 
 export default function App() {
   const [tab, setTab] = useState("Recipes");
-  const [recipes, setRecipesRaw] = useState(() => load("recipes", []));
-  const [pantry, setPantryRaw] = useState(() => load("pantry", []));
+  const [recipes, setRecipesRaw] = useState(() => dedupeById(load("recipes", [])));
+  const [pantry, setPantryRaw] = useState(() => dedupeById(load("pantry", [])));
   const [plan, setPlanRaw] = useState(() => load("plan", emptyPlan()));
   const [settings, setSettingsRaw] = useState(() => load("settings", DEFAULT_SETTINGS));
   const [dictionary, setDictionaryRaw] = useState(() => load("dictionary", []));
@@ -3325,6 +3361,14 @@ export default function App() {
   }, []);
   const setSpices = useCallback(v => {
     setSpicesRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("spices", next); return next; });
+  }, []);
+
+  // On mount, persist the deduped recipes/pantry so any healed duplicate ids
+  // are written back (the initial useState dedupe is in memory only otherwise).
+  useEffect(() => {
+    save("recipes", recipes);
+    save("pantry", pantry);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
