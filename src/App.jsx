@@ -498,6 +498,9 @@ function generatePlan(recipes, existingPlan, settings, activePersonIds = null) {
     // For each slot that has a main, add sides toward the meal's sidesMin.
     const mealComp = comp[meal] || { sidesMin:0, sidesMax:0 };
     const sidesTarget = mealComp.sidesMin || 0;
+    // Preferred side tags for this meal: sides carrying these get weighted up
+    // so e.g. dinner leans toward a salad or soup. Empty = no preference.
+    const preferredSideTags = new Set(mealComp.sideTags || []);
     if (sidesTarget > 0) {
       const sidePool = eligible.filter(r => (r.mealTags || []).includes(mealKey) && (r.role || "main") === "side");
       if (sidePool.length > 0) {
@@ -512,7 +515,12 @@ function generatePlan(recipes, existingPlan, settings, activePersonIds = null) {
             guard++;
             const existingIds = new Set(slotEntries(s).map(e => e.recipeId));
             const candidates = sidePool.filter(r => !existingIds.has(r.id))
-              .map(r => ({ r, w: calcWeight(r, settings, tagCounts, activePersonIds) }))
+              .map(r => {
+                let w = calcWeight(r, settings, tagCounts, activePersonIds);
+                // Bias toward preferred side tags (3× when a tag matches).
+                if (preferredSideTags.size && (r.tags || []).some(t => preferredSideTags.has(t))) w *= 3;
+                return { r, w };
+              })
               .filter(x => x.w > 0);
             if (candidates.length === 0) break;
             const totW = candidates.reduce((a, x) => a + x.w, 0);
@@ -2744,7 +2752,7 @@ function SettingsTab({ settings, setSettings, people, setPeople, pantry, recipes
 
       {section === "people" && <PeopleSection people={people} setPeople={setPeople} />}
       {section === "preferences" && <CalibrationSection settings={settings} update={update} />}
-      {section === "meals" && <MealCompositionSection settings={settings} update={update} />}
+      {section === "meals" && <MealCompositionSection settings={settings} update={update} recipes={recipes} />}
       {section === "ranges" && <RangesSection ranges={settings.ranges} onChange={v => update("ranges", v)} tagWeights={settings.tagWeights} />}
       {section === "redlist" && <RedListSection redList={settings.redList} onChange={v => update("redList", v)} ingredientPool={ingredientPool} />}
       {section === "excludes" && <ExcludesSection excludes={settings.excludes} onChange={v => update("excludes", v)} people={people} ingredientPool={ingredientPool} />}
@@ -2874,11 +2882,19 @@ function bandToHeaviness(band) {
 // Per-meal mains/sides counts. Sets how many main dishes and side dishes each
 // meal type can hold; the generator fills toward these and the Plan UI composes
 // within them.
-function MealCompositionSection({ settings, update }) {
+function MealCompositionSection({ settings, update, recipes = [] }) {
   const comp = settings.mealComposition || {};
+  // Available side tags: tags appearing on side-role recipes.
+  const sideTagOptions = [...new Set(recipes.filter(r => (r.role||"main")==="side").flatMap(r => r.tags || []))].sort();
   const setField = (meal, field, val) => {
     const cur = comp[meal] || { mainsMin:1, mainsMax:1, sidesMin:0, sidesMax:1 };
     update("mealComposition", { ...comp, [meal]: { ...cur, [field]: Math.max(0, Math.round(val)) } });
+  };
+  const toggleSideTag = (meal, tag) => {
+    const cur = comp[meal] || { mainsMin:1, mainsMax:1, sidesMin:0, sidesMax:1 };
+    const tags = new Set(cur.sideTags || []);
+    tags.has(tag) ? tags.delete(tag) : tags.add(tag);
+    update("mealComposition", { ...comp, [meal]: { ...cur, sideTags: [...tags] } });
   };
   const Row = ({ meal, label, kind }) => {
     const c = comp[meal] || { mainsMin:1, mainsMax:1, sidesMin:0, sidesMax:1 };
@@ -2898,13 +2914,31 @@ function MealCompositionSection({ settings, update }) {
       <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:14, lineHeight:1.45 }}>
         How many main dishes and sides each meal can hold. For example, dinner with 1–2 mains and 0–2 sides means it'll have at least one main and can add a second, plus up to two sides like a soup or salad.
       </div>
-      {MEALS.map(meal => (
-        <div key={meal} style={{ marginBottom:16, padding:"12px 14px", borderRadius:10, background:COLORS.surface }}>
-          <div style={{ fontSize:14, fontWeight:700, color:MC[meal]?.fg || COLORS.text, marginBottom:8 }}>{meal}</div>
-          <Row meal={meal} label="Mains" kind="mains" />
-          <Row meal={meal} label="Sides" kind="sides" />
-        </div>
-      ))}
+      {MEALS.map(meal => {
+        const c = comp[meal] || { mainsMin:1, mainsMax:1, sidesMin:0, sidesMax:1 };
+        const chosenSideTags = new Set(c.sideTags || []);
+        return (
+          <div key={meal} style={{ marginBottom:16, padding:"12px 14px", borderRadius:10, background:COLORS.surface }}>
+            <div style={{ fontSize:14, fontWeight:700, color:MC[meal]?.fg || COLORS.text, marginBottom:8 }}>{meal}</div>
+            <Row meal={meal} label="Mains" kind="mains" />
+            <Row meal={meal} label="Sides" kind="sides" />
+            {(c.sidesMax > 0 || c.sidesMin > 0) && sideTagOptions.length > 0 && (
+              <div style={{ marginTop:8 }}>
+                <div style={{ fontSize:10, color:COLORS.textSec, marginBottom:4 }}>Lean sides toward <span style={{ fontWeight:600 }}>(optional)</span>:</div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
+                  {sideTagOptions.map(tag => (
+                    <span key={tag} onClick={() => toggleSideTag(meal, tag)}
+                      style={{ fontSize:11, padding:"3px 9px", borderRadius:99, cursor:"pointer", fontWeight:chosenSideTags.has(tag)?700:500,
+                        background:chosenSideTags.has(tag)?"#7A5C2E":"#fff", color:chosenSideTags.has(tag)?"#fff":COLORS.textSec, border:`1px solid ${chosenSideTags.has(tag)?"#7A5C2E":COLORS.border}` }}>
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
