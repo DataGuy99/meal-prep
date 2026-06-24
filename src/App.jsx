@@ -1053,6 +1053,9 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [grouped, setGrouped] = useState(false);
+  const [roleFilter, setRoleFilter] = useState("all");   // all | main | side
+  const [tagFilter, setTagFilter] = useState("all");      // all | <tag>
+  const [mealFilter, setMealFilter] = useState("all");    // all | breakfast | lunch | dinner
   const [expandedId, setExpandedId] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
   const [editId, setEditId] = useState(null); // recipe id being edited, or null for new
@@ -1060,10 +1063,23 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
   const formRef = useRef(null);
 
   const allTags = useMemo(() => [...new Set([...Object.keys(settings.tagWeights || {}), ...recipes.flatMap(r => r.tags || [])])].sort(), [recipes, settings.tagWeights]);
+  // Tag options scoped to the current role filter, so sub-filtering shows only
+  // relevant tags (e.g. mains → beef/chicken, sides → carrot/salad).
+  const tagOptions = useMemo(() => {
+    const pool = recipes.filter(r => roleFilter === "all" || (r.role || "main") === roleFilter);
+    return [...new Set(pool.flatMap(r => r.tags || []))].sort();
+  }, [recipes, roleFilter]);
+  // If the chosen tag isn't available under the current role, clear it.
+  useEffect(() => {
+    if (tagFilter !== "all" && !tagOptions.includes(tagFilter)) setTagFilter("all");
+  }, [tagOptions, tagFilter]);
 
   const filtered = recipes.filter(r => {
     if (filter === "favorites" && !(r.stars >= 4)) return false;
     if (filter === "quarantine" && !r.quarantine) return false;
+    if (roleFilter !== "all" && (r.role || "main") !== roleFilter) return false;
+    if (tagFilter !== "all" && !(r.tags || []).includes(tagFilter)) return false;
+    if (mealFilter !== "all" && !(r.mealTags || []).includes(mealFilter)) return false;
     if (search.trim()) {
       const q = search.toLowerCase();
       const inName = r.name.toLowerCase().includes(q);
@@ -1206,6 +1222,26 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
               {search && <span onClick={() => setSearch("")} style={{ position:"absolute", right:10, top:"50%", transform:"translateY(-50%)", fontSize:15, color:COLORS.textSec, cursor:"pointer" }}>×</span>}
             </div>
             <Btn small variant={grouped?"primary":"ghost"} onClick={() => setGrouped(g => !g)} title="Group by category">⊞ Group</Btn>
+          </div>
+          <div style={{ display:"flex", gap:6, marginBottom:14, flexWrap:"wrap" }}>
+            <select value={roleFilter} onChange={e => setRoleFilter(e.target.value)} style={{ flex:"1 1 auto", minWidth:90, padding:"7px 8px", borderRadius:6, border:`1.5px solid ${roleFilter!=="all"?COLORS.primary:COLORS.border}`, fontSize:12, background:"#fff", color:roleFilter!=="all"?COLORS.primary:COLORS.text, fontWeight:roleFilter!=="all"?600:400 }}>
+              <option value="all">All dishes</option>
+              <option value="main">Mains only</option>
+              <option value="side">Sides only</option>
+            </select>
+            <select value={tagFilter} onChange={e => setTagFilter(e.target.value)} disabled={tagOptions.length===0} style={{ flex:"1 1 auto", minWidth:90, padding:"7px 8px", borderRadius:6, border:`1.5px solid ${tagFilter!=="all"?COLORS.primary:COLORS.border}`, fontSize:12, background:"#fff", color:tagFilter!=="all"?COLORS.primary:COLORS.text, fontWeight:tagFilter!=="all"?600:400 }}>
+              <option value="all">Any tag</option>
+              {tagOptions.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <select value={mealFilter} onChange={e => setMealFilter(e.target.value)} style={{ flex:"1 1 auto", minWidth:90, padding:"7px 8px", borderRadius:6, border:`1.5px solid ${mealFilter!=="all"?COLORS.primary:COLORS.border}`, fontSize:12, background:"#fff", color:mealFilter!=="all"?COLORS.primary:COLORS.text, fontWeight:mealFilter!=="all"?600:400 }}>
+              <option value="all">Any meal</option>
+              <option value="breakfast">Breakfast</option>
+              <option value="lunch">Lunch</option>
+              <option value="dinner">Dinner</option>
+            </select>
+            {(roleFilter!=="all" || tagFilter!=="all" || mealFilter!=="all") && (
+              <Btn small variant="ghost" onClick={() => { setRoleFilter("all"); setTagFilter("all"); setMealFilter("all"); }}>Clear</Btn>
+            )}
           </div>
           {!showAdd && <Btn onClick={() => { setEditId(null); setAddForm(blankForm); setShowAdd(true); setTimeout(() => formRef.current?.scrollIntoView({ behavior:"smooth", block:"start" }), 50); }} style={{ width:"100%", marginBottom:14 }}>+ Add Recipe</Btn>}
       <div style={{ marginTop:16 }}>
