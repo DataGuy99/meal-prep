@@ -394,11 +394,10 @@ function generatePlan(recipes, existingPlan, settings, activePersonIds = null) {
 
   const tagCounts = {};
   const usedRecipes = new Set();
-  // Count existing locked assignments
+  // Count existing locked assignments (every entry — mains and sides).
   DAYS.forEach(d => MEALS.forEach(m => {
-    const s = plan[d][m];
-    if (s) {
-      const r = recipes.find(x => x.id === s.recipeId);
+    for (const e of slotEntries(plan[d][m])) {
+      const r = recipes.find(x => x.id === e.recipeId);
       if (r) {
         usedRecipes.add(r.id);
         (r.tags || []).forEach(t => { tagCounts[t] = (tagCounts[t] || 0) + 1; });
@@ -408,25 +407,31 @@ function generatePlan(recipes, existingPlan, settings, activePersonIds = null) {
 
   // Recipe tag-score = sum of its tag weights. Used for meal-target banding.
   const tagScoreOf = (r) => (r.tags || []).reduce((s, t) => s + (settings.tagWeights[t] || 10), 0);
+  const comp = settings.mealComposition || {};
 
   for (const meal of MEALS) {
-    const emptySlots = DAYS.filter(d => !plan[d][meal]);
+    // A slot needs a main if it has no main entry yet (and isn't a placeholder).
+    const needsMain = (d) => {
+      const s = plan[d][meal];
+      if (s?.placeholder) return false;
+      if (s?.locked && slotMains(s, recipes).length > 0) return false;
+      return slotMains(s, recipes).length === 0;
+    };
+    const emptySlots = DAYS.filter(needsMain);
     if (emptySlots.length === 0) continue;
 
     const mealKey = meal.toLowerCase();
-    const pool = eligible.filter(r => (r.mealTags || []).includes(mealKey));
+    // Mains pool only — sides are filled in a separate pass.
+    const pool = eligible.filter(r => (r.mealTags || []).includes(mealKey) && (r.role || "main") === "main");
     let remaining = [...emptySlots];
 
-    // Meal-target banding: accumulate tag-score for this meal type. Below the
-    // band's min, bias toward higher-scoring recipes to climb into band; once
-    // at/over max, taper score-heavy picks. Seed with any locked slots' scores.
+    // Meal-target banding: accumulate tag-score for this meal type.
     const band = mealTargets?.[meal];
     let mealScore = 0;
     if (band) {
       DAYS.forEach(d => {
-        const s = plan[d][meal];
-        if (s?.recipeId) {
-          const r = recipes.find(x => x.id === s.recipeId);
+        for (const e of slotMains(plan[d][meal], recipes)) {
+          const r = recipes.find(x => x.id === e.recipeId);
           if (r) mealScore += tagScoreOf(r);
         }
       });
@@ -443,10 +448,8 @@ function generatePlan(recipes, existingPlan, settings, activePersonIds = null) {
         if (band && base > 0) {
           const score = tagScoreOf(r);
           if (mealScore < band.min) {
-            // Below band: prefer recipes that move us toward min (favor higher score)
             base *= 1 + (score / Math.max(1, band.max)) * 0.6;
           } else if (mealScore >= band.max) {
-            // At/over band: taper score-heavy recipes (favor lighter ones)
             base *= Math.max(0.3, 1 - (score / Math.max(1, band.max)) * 0.6);
           }
         }
@@ -479,16 +482,51 @@ function generatePlan(recipes, existingPlan, settings, activePersonIds = null) {
       const chunkSize = Math.floor(Math.random() * (maxChunk - minChunk + 1)) + minChunk;
 
       for (let i = 0; i < chunkSize && i < remaining.length; i++) {
-        plan[remaining[i]][meal] = {
-          recipeId: picked.id,
-          recipeName: picked.name,
-          locked: false,
-        };
+        const d = remaining[i];
+        const existing = plan[d][meal];
+        const entry = { recipeId: picked.id, recipeName: picked.name, role: "main" };
+        const prior = slotEntries(existing);
+        plan[d][meal] = { entries: [...prior, entry], locked: existing?.locked || false };
       }
       remaining = remaining.slice(chunkSize);
       usedRecipes.add(picked.id);
       (picked.tags || []).forEach(t => { tagCounts[t] = (tagCounts[t] || 0) + chunkSize; });
       if (band) mealScore += tagScoreOf(picked) * chunkSize;
+    }
+
+    // ── Sides pass ──────────────────────────────────────────────────
+    // For each slot that has a main, add sides toward the meal's sidesMin.
+    const mealComp = comp[meal] || { sidesMin:0, sidesMax:0 };
+    const sidesTarget = mealComp.sidesMin || 0;
+    if (sidesTarget > 0) {
+      const sidePool = eligible.filter(r => (r.mealTags || []).includes(mealKey) && (r.role || "main") === "side");
+      if (sidePool.length > 0) {
+        DAYS.forEach(d => {
+          const s = plan[d][meal];
+          if (!s || s.placeholder) return;
+          if (slotMains(s, recipes).length === 0) return; // only add sides to real meals
+          if (s.locked) return; // respect locked slots
+          let have = slotSides(s, recipes).length;
+          let guard = 0;
+          while (have < sidesTarget && guard < 20) {
+            guard++;
+            const existingIds = new Set(slotEntries(s).map(e => e.recipeId));
+            const candidates = sidePool.filter(r => !existingIds.has(r.id))
+              .map(r => ({ r, w: calcWeight(r, settings, tagCounts, activePersonIds) }))
+              .filter(x => x.w > 0);
+            if (candidates.length === 0) break;
+            const totW = candidates.reduce((a, x) => a + x.w, 0);
+            let rnd = Math.random() * totW;
+            let pick = candidates[0].r;
+            for (const { r, w } of candidates) { rnd -= w; if (rnd <= 0) { pick = r; break; } }
+            const entry = { recipeId: pick.id, recipeName: pick.name, role: "side" };
+            plan[d][meal] = { ...s, entries: [...slotEntries(s), entry] };
+            (pick.tags || []).forEach(t => { tagCounts[t] = (tagCounts[t] || 0) + 1; });
+            usedRecipes.add(pick.id);
+            have++;
+          }
+        });
+      }
     }
   }
   return plan;
@@ -497,10 +535,15 @@ function generatePlan(recipes, existingPlan, settings, activePersonIds = null) {
 function rerollSlot(day, meal, recipes, plan, settings, activePersonIds = null) {
   const mealKey = meal.toLowerCase();
   const now = Date.now();
-  const currentRecipeId = plan[day]?.[meal]?.recipeId;
+  const slot = plan[day]?.[meal];
+  // Reroll replaces the main(s); keep existing sides. The current mains are
+  // excluded so we get something different.
+  const currentMainIds = new Set(slotMains(slot, recipes).map(e => e.recipeId));
+  const keepSides = slotSides(slot, recipes);
 
   const eligible = recipes.filter(r => {
-    if (r.quarantine || r.id === currentRecipeId) return false;
+    if (r.quarantine || currentMainIds.has(r.id)) return false;
+    if ((r.role || "main") !== "main") return false; // reroll picks a main
     if (!(r.mealTags || []).includes(mealKey)) return false;
     if (!qualifyRecipe(r, settings.excludes, activePersonIds, now, settings.maxOmissions).qualified) return false;
     return true;
@@ -517,7 +560,8 @@ function rerollSlot(day, meal, recipes, plan, settings, activePersonIds = null) 
 
   const newPlan = JSON.parse(JSON.stringify(plan));
   newPlan[day][meal] = {
-    recipeId: picked.id, recipeName: picked.name, locked: false,
+    entries: [{ recipeId: picked.id, recipeName: picked.name, role: "main" }, ...keepSides],
+    locked: false,
   };
   return newPlan;
 }
@@ -1543,8 +1587,7 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
     // 5 slots logs 5 timestamps so the frequency layer reflects real load.
     const slotCounts = {};
     DAYS.forEach(d => MEALS.forEach(m => {
-      const id = newPlan[d]?.[m]?.recipeId;
-      if (id) slotCounts[id] = (slotCounts[id] || 0) + 1;
+      for (const e of slotEntries(newPlan[d]?.[m])) slotCounts[e.recipeId] = (slotCounts[e.recipeId] || 0) + 1;
     }));
     const now = Date.now();
     setRecipes(prev => prev.map(r => {
@@ -1684,16 +1727,16 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
     }
   }));
 
-  // Range compliance
+  // Range compliance — count tags across all entries (mains + sides).
   const tagCounts = {};
   DAYS.forEach(d => MEALS.forEach(m => {
-    const s = plan?.[d]?.[m];
-    if (!s?.recipeId) return;
-    const r = recipes.find(x => x.id === s.recipeId);
-    (r?.tags||[]).forEach(t => { tagCounts[t] = (tagCounts[t]||0) + 1; });
+    for (const e of slotEntries(plan?.[d]?.[m])) {
+      const r = recipes.find(x => x.id === e.recipeId);
+      (r?.tags||[]).forEach(t => { tagCounts[t] = (tagCounts[t]||0) + 1; });
+    }
   }));
 
-  const emptySlots = DAYS.reduce((a, d) => a + MEALS.filter(m => !plan?.[d]?.[m]).length, 0);
+  const emptySlots = DAYS.reduce((a, d) => a + MEALS.filter(m => !slotFilled(plan?.[d]?.[m])).length, 0);
   const notifications = [];
   if (emptySlots > 0) notifications.push({ icon:"📋", text:`${emptySlots} empty slot${emptySlots>1?"s":""}`, bg:COLORS.lunchBg, color:COLORS.lunch, action:"Autofill", onAction: autofillBlanks });
 
