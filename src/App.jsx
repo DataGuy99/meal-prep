@@ -2109,8 +2109,15 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
               <Btn style={{ flex:1, background:COLORS.gold }} onClick={() => applyCook(cookModal.day, cookModal.meal, cookModal.recipe, cookModal)}>Confirm & Cook</Btn>
               <Btn variant="ghost" onClick={() => setCookModal(null)}>Cancel</Btn>
             </div>
-            <div style={{ textAlign:"center", marginTop:8 }}>
-              <span onClick={() => { setViewRecipe(cookModal.recipe); }} style={{ fontSize:12, color:COLORS.primary, cursor:"pointer", textDecoration:"underline" }}>📖 View full recipe & instructions</span>
+            <div style={{ textAlign:"center", marginTop:8, display:"flex", flexDirection:"column", gap:4 }}>
+              {(cookModal.recipe.recipeList && cookModal.recipe.recipeList.length > 1
+                ? cookModal.recipe.recipeList
+                : [cookModal.recipe]
+              ).map((rec, i) => (
+                <span key={rec.id || i} onClick={() => setViewRecipe(rec)} style={{ fontSize:12, color:COLORS.primary, cursor:"pointer", textDecoration:"underline" }}>
+                  📖 View {rec.name} recipe & instructions
+                </span>
+              ))}
             </div>
           </div>
         </div>
