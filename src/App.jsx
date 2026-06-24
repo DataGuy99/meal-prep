@@ -192,6 +192,14 @@ function canonicalizeTag(input, knownTags) {
 function parseIngredientLine(line) {
   line = line.trim();
   if (!line) return null;
+  // Strip paste artifacts: checkbox glyphs, bullets, and leading list markers
+  // that come along when copy-pasting recipes from websites.
+  line = line
+    .replace(/[\u2610\u2611\u2612\u25A1\u25A0\u2022\u25AA\u25CF\u25E6\u2043\u2219\u00B7\u2024\u2027\u2756\u2666\u25C6\u274F\u2751\u2752]/g, " ")
+    .replace(/^[\s\-–—*▢□☐■●○◦‣·]+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!line) return null;
   const m = line.match(/^([\d.\/]+)\s*(g|kg|oz|lb|lbs?|ml|l|cups?|tbsp|tsp|cans?|bottles?|bags?|heads?|pcs?|pieces?|bunch|bunches?|cloves?|stalks?|blocks?|fillets?|slices?)?\s+(.+)$/i);
   if (m) {
     let qty = m[1].includes("/") ? m[1].split("/").reduce((a,b) => a/b) : parseFloat(m[1]);
@@ -1015,6 +1023,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
             </div>
             <Btn small variant={grouped?"primary":"ghost"} onClick={() => setGrouped(g => !g)} title="Group by category">⊞ Group</Btn>
           </div>
+          {!showAdd && <Btn onClick={() => { setEditId(null); setAddForm(blankForm); setShowAdd(true); setTimeout(() => formRef.current?.scrollIntoView({ behavior:"smooth", block:"start" }), 50); }} style={{ width:"100%", marginBottom:14 }}>+ Add Recipe</Btn>}
         </>
       )}
       {recipes.length === 0 && !showAdd && (
@@ -1145,9 +1154,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
         return <div style={{ display:"flex", flexDirection:"column", gap:8 }}>{filtered.map(renderCard)}</div>;
       })()}
       <div style={{ marginTop:16 }}>
-        {!showAdd ? (
-          recipes.length > 0 && <Btn onClick={() => setShowAdd(true)} style={{ width:"100%" }}>+ Add Recipe</Btn>
-        ) : (
+        {showAdd && (
           <div ref={formRef}>
           <Card style={{ border:`2px solid ${COLORS.primary}` }}>
             <div style={{ fontSize:14, fontWeight:700, color:COLORS.primary, marginBottom:10 }}>{editId ? "Edit Recipe" : "New Recipe"}</div>
@@ -2042,7 +2049,7 @@ function ShopTab({ plan, recipes, pantry, setPantry, spices, setSpices, settings
                         {item.reason && <div style={{ fontSize:9, color:COLORS.red }}>{item.reason}</div>}
                       </div>
                       <div style={{ textAlign:"right", flexShrink:0 }}>
-                        <div style={{ fontSize:12, color:COLORS.textSec }}>{item.qty}{item.unit ? " " + item.unit : ""}</div>
+                        <div style={{ fontSize:12, color:COLORS.textSec }}>{item.unit ? `${item.qty} ${item.unit}` : `×${item.qty}`}</div>
                         {groupBy==="category" && item.store && <div style={{ fontSize:9, color:COLORS.textSec }}>{item.store}</div>}
                       </div>
                     </div>
