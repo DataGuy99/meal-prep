@@ -876,7 +876,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
   const [expandedId, setExpandedId] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
   const [editId, setEditId] = useState(null); // recipe id being edited, or null for new
-  const [addForm, setAddForm] = useState({ name:"", tags:[], mealTags:[], servings:4, slotsMin:2, slotsMax:4, stars:3, essentialText:"", secondaryText:"", instructions:"" });
+  const [addForm, setAddForm] = useState({ name:"", tags:[], mealTags:[], servings:4, slotsMin:2, slotsMax:4, stars:3, essentialText:"", secondaryText:"", instructions:"", url:"" });
   const formRef = useRef(null);
 
   const allTags = useMemo(() => [...new Set([...Object.keys(settings.tagWeights || {}), ...recipes.flatMap(r => r.tags || [])])].sort(), [recipes, settings.tagWeights]);
@@ -919,7 +919,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
     bg: COLORS.quarantineBg, color: COLORS.quarantine,
   }));
 
-  const blankForm = { name:"", tags:[], mealTags:[], servings:4, slotsMin:2, slotsMax:4, stars:3, essentialText:"", secondaryText:"", instructions:"" };
+  const blankForm = { name:"", tags:[], mealTags:[], servings:4, slotsMin:2, slotsMax:4, stars:3, essentialText:"", secondaryText:"", instructions:"", url:"" };
 
   // Serialize a recipe's ingredients of one tier back into editable text lines.
   // Keep the quantity whenever there's a unit (so "1 kg beef" round-trips); only
@@ -941,6 +941,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
       essentialText: ingsToText(r.ingredients, "essential"),
       secondaryText: ingsToText(r.ingredients, "secondary"),
       instructions: r.instructions || "",
+      url: r.url || "",
     });
     setEditId(r.id);
     setShowAdd(true);
@@ -973,6 +974,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
       servings: addForm.servings, slotsMin: addForm.slotsMin, slotsMax: addForm.slotsMax,
       ingredients: newIngs, quarantine: isQ,
       instructions: addForm.instructions.trim(),
+      url: addForm.url.trim(),
       quarantineItems: redHits.map(r => ({ ingredient: r.name, sub: "" })),
     };
 
@@ -1077,6 +1079,11 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
                 <div style={{ fontSize:10, color:COLORS.textSec, marginBottom:3 }}>Steps to make it. Shown when you're cooking the meal.</div>
                 <textarea placeholder={"1. Brown the chicken...\n2. Add the sauce and simmer 20 min...\n3. Serve over rice"} value={addForm.instructions} onChange={e => setAddForm(p => ({ ...p, instructions: e.target.value }))} rows={4} style={{ width:"100%", boxSizing:"border-box", padding:"8px 10px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13, resize:"vertical", fontFamily:"inherit" }} />
               </div>
+              <div>
+                <div style={{ fontSize:11, color:COLORS.text, marginBottom:2, fontWeight:700 }}>Link <span style={{ color:COLORS.textSec, fontWeight:400 }}>(optional)</span></div>
+                <div style={{ fontSize:10, color:COLORS.textSec, marginBottom:3 }}>A link to the original recipe, if you have one.</div>
+                <input type="url" inputMode="url" placeholder="https://..." value={addForm.url} onChange={e => setAddForm(p => ({ ...p, url: e.target.value }))} style={{ width:"100%", boxSizing:"border-box", padding:"8px 10px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13 }} />
+              </div>
               <div style={{ display:"flex", gap:8 }}>
                 <Btn style={{ flex:1 }} onClick={saveRecipe} disabled={!addForm.name.trim() || !addForm.essentialText.trim()}>{editId ? "Save Changes" : "Save Recipe"}</Btn>
                 <Btn variant="ghost" onClick={closeForm}>Cancel</Btn>
@@ -1151,6 +1158,11 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
                 <div style={{ marginBottom:10 }}>
                   <div style={{ fontSize:10, color:COLORS.textSec, fontWeight:600, marginBottom:4 }}>Instructions</div>
                   <textarea value={r.instructions || ""} onChange={e => updateRecipe(r.id, { instructions: e.target.value })} placeholder="Add steps to make this meal..." rows={3} style={{ width:"100%", boxSizing:"border-box", padding:"8px 10px", borderRadius:6, border:`1px solid ${COLORS.border}`, fontSize:13, resize:"vertical", fontFamily:"inherit" }} />
+                </div>
+                <div style={{ marginBottom:10 }}>
+                  <div style={{ fontSize:10, color:COLORS.textSec, fontWeight:600, marginBottom:4 }}>Link</div>
+                  <input type="url" inputMode="url" value={r.url || ""} onChange={e => updateRecipe(r.id, { url: e.target.value })} placeholder="https://..." style={{ width:"100%", boxSizing:"border-box", padding:"8px 10px", borderRadius:6, border:`1px solid ${COLORS.border}`, fontSize:13 }} />
+                  {r.url && <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ display:"inline-flex", alignItems:"center", gap:5, marginTop:5, fontSize:12, color:COLORS.primary, textDecoration:"none", fontWeight:600 }}>🔗 Open recipe</a>}
                 </div>
                 {(() => {
                   const renderIng = (ing, idx) => {
@@ -1852,6 +1864,12 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
                 <div style={{ fontSize:14, lineHeight:1.6, whiteSpace:"pre-wrap" }}>{viewRecipe.instructions}</div>
               ) : (
                 <div style={{ fontSize:13, color:COLORS.textSec, fontStyle:"italic" }}>No instructions added for this recipe. You can add them by editing the recipe in the Recipes tab.</div>
+              )}
+
+              {viewRecipe.url && (
+                <a href={viewRecipe.url} target="_blank" rel="noopener noreferrer" style={{ display:"inline-flex", alignItems:"center", gap:6, marginTop:14, fontSize:13, color:COLORS.primary, textDecoration:"none", fontWeight:600 }}>
+                  🔗 Open original recipe
+                </a>
               )}
 
               <Btn style={{ width:"100%", marginTop:18 }} variant="secondary" onClick={() => setViewRecipe(null)}>Close</Btn>
