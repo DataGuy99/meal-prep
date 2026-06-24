@@ -131,7 +131,7 @@ function qualifyRecipe(recipe, excludes, activePersonIds, now = Date.now(), maxO
     if (!excludeActive(ex, now)) continue;
     if (!excludeApplies(ex, activePersonIds)) continue;
     const exName = normalize(ex.ingredient);
-    for (const ing of recipe.ingredients) {
+    for (const ing of (recipe.ingredients || [])) {
       if (normalize(ing.name) !== exName) continue;
       const tier = ing.tier || "essential";
       if (tier === "essential") {
@@ -304,7 +304,7 @@ function calcWeight(recipe, settings, planTagCounts, activePersonIds = null) {
     const item = normalize(b.item);
     if (!item) continue;
     const matchesTag = recipeTags.includes(item);
-    const matchesIng = recipe.ingredients.some(ing => {
+    const matchesIng = (recipe.ingredients || []).some(ing => {
       const n = normalize(ing.name);
       return n === item || n.split(" ").includes(item);
     });
@@ -541,7 +541,7 @@ function generateShoppingList(plan, recipes, pantry, excludes = [], activePerson
     // from the shopping list.
     const qual = qualifyRecipe(recipe, excludes, activePersonIds, now, maxOmissions);
     const omittedSet = new Set(qual.omitted.map(n => normalize(n)));
-    for (const ing of recipe.ingredients) {
+    for (const ing of (recipe.ingredients || [])) {
       if (omittedSet.has(normalize(ing.name))) continue;
       const key = normalize(ing.name);
       if (!needs[key]) needs[key] = { name: ing.name, category: guessCategory(ing.name), families: {} };
@@ -995,7 +995,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
     setRecipes(prev => prev.map(r => {
       if (r.id !== recipeId) return r;
       const qi = r.quarantineItems.map(q => q.ingredient === ingredient ? { ...q, sub: sub.trim() } : q);
-      const ings = r.ingredients.map(i => normalize(i.name) === normalize(ingredient) ? { ...i, name: normalize(sub) } : i);
+      const ings = (r.ingredients || []).map(i => normalize(i.name) === normalize(ingredient) ? { ...i, name: normalize(sub) } : i);
       const allResolved = qi.every(q => q.sub);
       return { ...r, quarantineItems: qi, ingredients: ings, quarantine: !allResolved };
     }));
@@ -1100,8 +1100,8 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
                     );
                   };
                   // Legacy recipes have no tier — treat those as essential.
-                  const essential = r.ingredients.filter(i => (i.tier || "essential") === "essential");
-                  const secondary = r.ingredients.filter(i => i.tier === "secondary");
+                  const essential = (r.ingredients || []).filter(i => (i.tier || "essential") === "essential");
+                  const secondary = (r.ingredients || []).filter(i => i.tier === "secondary");
                   return (
                     <>
                       <div style={{ fontSize:11, fontWeight:700, color:COLORS.primary, marginBottom:4 }}>Essential ({essential.length})</div>
@@ -1263,7 +1263,7 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
   function buildCookLines(recipe) {
     const factor = scaleFor(recipe);
     const tracked = [], spices = [], untracked = [];
-    for (const ing of recipe.ingredients) {
+    for (const ing of (recipe.ingredients || [])) {
       const cat = guessCategory(ing.name);
       if (cat === "Spices") { spices.push(ing.name); continue; }
       const need = (ing.qty || 1) * factor;
@@ -1809,8 +1809,8 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
       {viewRecipe && (() => {
         const factor = scaleFor(viewRecipe);
         const scaled = (q) => factor === 1 ? q : round1((q || 1) * factor);
-        const essential = viewRecipe.ingredients.filter(i => (i.tier || "essential") === "essential");
-        const secondary = viewRecipe.ingredients.filter(i => i.tier === "secondary");
+        const essential = (viewRecipe.ingredients || []).filter(i => (i.tier || "essential") === "essential");
+        const secondary = (viewRecipe.ingredients || []).filter(i => i.tier === "secondary");
         const renderLine = (ing, i) => (
           <div key={i} style={{ display:"flex", gap:8, padding:"5px 0", borderBottom:`1px solid ${COLORS.border}40` }}>
             <span style={{ fontSize:13, color:COLORS.textSec, minWidth:64, flexShrink:0 }}>
