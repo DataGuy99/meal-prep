@@ -636,6 +636,65 @@ function rerollSlot(day, meal, recipes, plan, settings, activePersonIds = null) 
   return newPlan;
 }
 
+// Shuffle just the sides of a meal: keep the main(s), swap the sides for a fresh
+// draw of the same count from the side pool. Honors this meal's preferred side
+// tags (weighting matches 3×) and excludes the sides currently present so the
+// result is different. The main is untouched.
+function shuffleSides(day, meal, recipes, plan, settings, activePersonIds = null) {
+  const mealKey = meal.toLowerCase();
+  const now = Date.now();
+  const slot = plan[day]?.[meal];
+  const mains = slotMains(slot, recipes);
+  const currentSides = slotSides(slot, recipes);
+  const howMany = currentSides.length;
+  if (howMany === 0) return plan; // nothing to shuffle
+
+  const currentSideIds = new Set(currentSides.map(e => e.recipeId));
+  const comp = (settings.mealComposition || {})[meal] || {};
+  const preferredSideTags = new Set(comp.sideTags || []);
+
+  const sidePool = recipes.filter(r => {
+    if (r.quarantine) return false;
+    if ((r.role || "main") !== "side") return false;
+    if (!(r.mealTags || []).includes(mealKey)) return false;
+    if (!qualifyRecipe(r, settings.excludes, activePersonIds, now, settings.maxOmissions).qualified) return false;
+    return true;
+  });
+
+  // Prefer brand-new sides (not the ones currently shown), but if the pool is
+  // too small to fill the count without reuse, allow the current ones back in.
+  const pickSides = [];
+  const used = new Set();
+  let guard = 0;
+  while (pickSides.length < howMany && guard < 40) {
+    guard++;
+    const avoid = pickSides.length + (sidePool.length - currentSideIds.size) >= howMany; // can we still avoid current?
+    const candidates = sidePool.filter(r => {
+      if (used.has(r.id)) return false;
+      if (avoid && currentSideIds.has(r.id)) return false;
+      return true;
+    }).map(r => {
+      let w = calcWeight(r, settings, {}, activePersonIds);
+      if (preferredSideTags.size && (r.tags || []).some(t => preferredSideTags.has(t))) w *= 3;
+      return { r, w };
+    }).filter(x => x.w > 0);
+    if (candidates.length === 0) break;
+    const totW = candidates.reduce((a, x) => a + x.w, 0);
+    let rnd = Math.random() * totW;
+    let pick = candidates[0].r;
+    for (const { r, w } of candidates) { rnd -= w; if (rnd <= 0) { pick = r; break; } }
+    pickSides.push({ recipeId: pick.id, recipeName: pick.name, role: "side" });
+    used.add(pick.id);
+  }
+
+  if (pickSides.length === 0) return plan;
+
+  const newPlan = JSON.parse(JSON.stringify(plan));
+  const mainEntries = mains.map(e => ({ recipeId: e.recipeId, recipeName: e.recipeName, role: "main", ...(e.cooked ? { cooked: e.cooked, cookedAt: e.cookedAt } : {}) }));
+  newPlan[day][meal] = { ...slot, entries: [...mainEntries, ...pickSides] };
+  return newPlan;
+}
+
 // ============================================================
 // SHOPPING LIST GENERATOR
 // ============================================================
@@ -1731,6 +1790,11 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
     setPlan(newPlan);
   }
 
+  function doShuffleSides(day, meal) {
+    const newPlan = shuffleSides(day, meal, recipes, plan, settings, activeIds);
+    setPlan(newPlan);
+  }
+
   function toggleLock(day, meal) {
     setPlan(prev => {
       const next = JSON.parse(JSON.stringify(prev));
@@ -2091,8 +2155,15 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
                   Sides <span style={{ color:COLORS.textSec, fontWeight:500 }}>({sides.length} of {comp.sidesMin}{comp.sidesMax!==comp.sidesMin?`–${comp.sidesMax}`:""})</span>
                 </div>
                 {sides.map(e => EntryRow(e, "side"))}
-                {!cooked && sides.length < comp.sidesMax && (
-                  <Btn small variant="ghost" onClick={() => { setPickerSlot({ day:selectedSlot.day, meal:selectedSlot.meal, role:"side" }); setPickerSearch(""); }}>+ Add side</Btn>
+                {!cooked && (
+                  <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                    {sides.length < comp.sidesMax && (
+                      <Btn small variant="ghost" onClick={() => { setPickerSlot({ day:selectedSlot.day, meal:selectedSlot.meal, role:"side" }); setPickerSearch(""); }}>+ Add side</Btn>
+                    )}
+                    {sides.length > 0 && (
+                      <Btn small variant="ghost" onClick={() => doShuffleSides(selectedSlot.day, selectedSlot.meal)}>🎲 Shuffle sides</Btn>
+                    )}
+                  </div>
                 )}
               </div>
 
