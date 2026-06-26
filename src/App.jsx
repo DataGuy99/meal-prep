@@ -257,24 +257,118 @@ function stripArtifacts(s) {
     .trim();
 }
 
+// Map long-form and abbreviated unit words to the canonical short unit.
+const UNIT_WORD_MAP = {
+  teaspoon: "tsp", teaspoons: "tsp", tsp: "tsp", tsps: "tsp", tspn: "tsp",
+  tablespoon: "tbsp", tablespoons: "tbsp", tbsp: "tbsp", tbsps: "tbsp", tbs: "tbsp", tbl: "tbsp",
+  cup: "cup", cups: "cup", c: "cup",
+  gram: "g", grams: "g", g: "g", gr: "g",
+  kilogram: "kg", kilograms: "kg", kg: "kg", kgs: "kg",
+  ounce: "oz", ounces: "oz", oz: "oz",
+  pound: "lb", pounds: "lb", lb: "lb", lbs: "lb",
+  milliliter: "ml", milliliters: "ml", millilitre: "ml", ml: "ml",
+  liter: "l", liters: "l", litre: "l", litres: "l", l: "l",
+  can: "can", cans: "can", bottle: "bottle", bottles: "bottle",
+  bag: "bag", bags: "bag", head: "head", heads: "head",
+  clove: "clove", cloves: "clove", stalk: "stalk", stalks: "stalk",
+  slice: "slice", slices: "slice", piece: "pc", pieces: "pc", pc: "pc", pcs: "pc",
+  bunch: "bunch", bunches: "bunch", block: "block", blocks: "block",
+  fillet: "fillet", fillets: "fillet", dozen: "dozen", pinch: "pinch", dash: "dash",
+};
+const UNIT_WORD_ALTERNATION = Object.keys(UNIT_WORD_MAP).sort((a, b) => b.length - a.length).join("|");
+
+// Unicode fraction glyphs → decimal.
+const FRACTION_MAP = { "½": 0.5, "⅓": 1/3, "⅔": 2/3, "¼": 0.25, "¾": 0.75, "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875, "⅕": 0.2, "⅖": 0.4, "⅗": 0.6, "⅘": 0.8, "⅙": 1/6, "⅚": 5/6 };
+
+// Parse a leading quantity token that may be: "2", "1/2", "1 1/2", "½", "1½",
+// or a RANGE like "3 to 4" / "3-4" / "¾ to 1" (we take the upper bound to be safe).
+function parseLeadingQty(s) {
+  let str = s.trim();
+  // Replace unicode fractions with " <decimal>" so "1½" -> "1 .5".
+  let expanded = "";
+  for (const ch of str) expanded += (FRACTION_MAP[ch] != null ? " " + FRACTION_MAP[ch] : ch);
+  expanded = expanded.trim();
+  // Range: take the part after "to"/"-" (upper bound).
+  const range = expanded.match(/^([\d.\/\s]+)\s*(?:to|-|–|—|or)\s*([\d.\/\s]+)\s+(.*)$/i);
+  if (range) {
+    const hi = evalQtyToken(range[2]);
+    if (hi != null) return { qty: hi, rest: range[3] };
+  }
+  // Mixed number or fraction or decimal at the start.
+  const m = expanded.match(/^((?:\d+\s+)?\d*\.?\d+(?:\/\d+)?(?:\s+\d+\/\d+)?)\s+(.*)$/);
+  if (m) {
+    const q = evalQtyToken(m[1]);
+    if (q != null) return { qty: q, rest: m[2] };
+  }
+  return null;
+}
+
+// Evaluate "1", "1.5", "1/2", "1 1/2", "0.5 0.5" (from a fraction glyph) -> number.
+function evalQtyToken(tok) {
+  const parts = tok.trim().split(/\s+/).filter(Boolean);
+  let total = 0;
+  for (const p of parts) {
+    if (p.includes("/")) {
+      const [a, b] = p.split("/").map(Number);
+      if (!b) return null;
+      total += a / b;
+    } else {
+      const n = parseFloat(p);
+      if (isNaN(n)) return null;
+      total += n;
+    }
+  }
+  return total || null;
+}
+
+// Strip trailing prep/instruction clauses that aren't part of the item identity:
+// "chicken breast into 1 inch cube", "fennel seed in a bag with a meat mallet",
+// "fish cake finely", "tofu moisture removed with paper towel and crumbled".
+function stripPrepClause(name) {
+  let n = name;
+  // Cut at common clause joiners that introduce instructions.
+  n = n.replace(/\b(into|in a|in to|cut into|cut in|sliced into|chopped into|moisture removed|with a |with the )\b.*$/i, "");
+  // Trailing lone adverbs/participles.
+  n = n.replace(/\b(finely|roughly|thinly|coarsely|lightly|well|thoroughly)\s*$/i, "");
+  // Leading "and " / "or " / "to " fragments from split lines.
+  n = n.replace(/^(and|or|to|the|a|an|of|with|for)\s+/i, "");
+  return n.replace(/\s+/g, " ").trim() || name;
+}
+
 function parseIngredientLine(line) {
   line = line.trim();
   if (!line) return null;
   line = stripArtifacts(line);
   if (!line) return null;
   if (isSectionHeader(line)) return null; // "For the sauce:", "garnish", etc. aren't ingredients
-  const m = line.match(/^([\d.\/]+)\s*(g|kg|oz|lb|lbs?|ml|l|cups?|tbsp|tsp|cans?|bottles?|bags?|heads?|pcs?|pieces?|bunch|bunches?|cloves?|stalks?|blocks?|fillets?|slices?)?\s+(.+)$/i);
-  if (m) {
-    let qty = m[1].includes("/") ? m[1].split("/").reduce((a,b) => a/b) : parseFloat(m[1]);
-    let unit = (m[2] || "").toLowerCase().replace(/s$/, "").replace("piece", "pc");
-    return { qty: qty || 1, unit, name: normalize(m[3]) };
+
+  // Broken-range remnant: a line starting "to 4 X" came from "3 to 4 X" being
+  // split. Drop the leading "to" so the number is read as the quantity.
+  line = line.replace(/^to\s+(?=[\d½⅓⅔¼¾⅛])/i, "");
+
+  // Pull a leading quantity (number, fraction, mixed, or range).
+  let qty = 1, rest = line;
+  const q = parseLeadingQty(line);
+  if (q) { qty = q.qty; rest = q.rest; }
+
+  // Now an optional unit WORD (short or long form) immediately after the qty.
+  let unit = "";
+  const uw = rest.match(new RegExp(`^(${UNIT_WORD_ALTERNATION})\\b\\.?\\s+(.*)$`, "i"));
+  if (uw) {
+    unit = UNIT_WORD_MAP[uw[1].toLowerCase()] || "";
+    rest = uw[2];
   }
-  const m2 = line.match(/^([\d.\/]+)\s+(.+)$/);
-  if (m2) {
-    let qty = m2[1].includes("/") ? m2[1].split("/").reduce((a,b) => a/b) : parseFloat(m2[1]);
-    return { qty: qty || 1, unit: "", name: normalize(m2[2]) };
-  }
-  return { qty: 1, unit: "", name: normalize(line) };
+
+  // Sometimes there's a SECOND quantity after the unit ("2 tablespoon 3 clove garlic"
+  // is rare; ignore). Strip a stray leading "of".
+  rest = rest.replace(/^of\s+/i, "");
+
+  // Clean instruction clauses out of the name.
+  let name = stripPrepClause(normalize(rest));
+  if (!name) return null;
+  if (isSectionHeader(name)) return null;
+
+  return { qty: qty || 1, unit, name: normalize(name) };
 }
 
 function guessCategory(name) {
@@ -844,6 +938,18 @@ const CANONICAL_BASE = [
   [/^(sweet rice wine|rice wine|cooking wine|shaoxing wine|shaoxing)?\s*\(?mirin\)?$/, "mirin"],
   // green onion / scallion synonyms
   [/^(spring onion|scallion|green onion)s?$/, "green onion"],
+  // proteins — collapse cut/prep variants to the base cut
+  [/.*\bchicken breast\b.*/, "chicken breast"],
+  [/.*\bchicken thigh\b.*/, "chicken thigh"],
+  [/^.*boneless skinless chicken.*$/, "chicken breast"],
+  [/.*\bground beef\b.*/, "ground beef"],
+  [/.*\b(rib eye|ribeye|top sirloin|sirloin)\b.*/, "beef"],
+  [/.*\bfish cake\b.*/, "fish cake"],
+  // condiments — collapse fat/style/homemade variants
+  [/^(low fat|reduced fat|full fat|light|homemade|japanese|kewpie)?\s*mayonnaise$/, "mayonnaise"],
+  [/^(low fat|reduced fat|full fat|light|homemade)?\s*mayo$/, "mayonnaise"],
+  [/^(tomato)?\s*ketchup$/, "ketchup"],
+  [/^(dijon|yellow|whole grain|english)?\s*mustard$/, "mustard"],
 ];
 
 // Recipe section headers that get pasted as if they were ingredients. Lines
@@ -856,7 +962,15 @@ const SECTION_HEADERS = new Set([
   "sauce", "marinade", "seasoning", "garnish", "topping", "filling", "dressing",
   "dipping sauce", "soy dipping sauce", "for the coating", "to serve", "optional",
   "for the rice", "for the noodles", "for the vegetables", "for the chicken",
+  "for sauce", "for meat", "for marinade", "for garnish", "for topping",
+  "second marination", "first marination", "marination", "for second marination",
+  "for first marination", "for the second marination", "for frying", "to taste",
+  "bulgogi marinade", "for the stir fry", "for the soup base", "for assembly",
+  "for the dumplings", "for cooking", "for the broth base",
 ]);
+
+// Items so ubiquitous they never belong on a shopping list — assume always on hand.
+const NEVER_BUY = new Set(["water", "ice", "ice water", "cold water", "hot water", "warm water", "boiling water", "tap water", "filtered water"]);
 
 // Reduce a raw ingredient name to its canonical shopping identity.
 function canonicalName(raw) {
@@ -868,6 +982,10 @@ function canonicalName(raw) {
   // Drop parentheticals and "for the X" trailing qualifiers.
   n = n.replace(/\([^)]*\)/g, " ");
   n = n.replace(/\bfor the [a-z ]+$/i, " ");
+  // Drop a trailing brand/qualifier phrase after a comma ("soy sauce, sempio brand").
+  n = n.replace(/,.*$/, " ");
+  // Drop trailing "homemade" / "store bought" / brand-ish trailing words.
+  n = n.replace(/\b(homemade|store bought|store-bought|brand)\b/gi, " ");
   // Remove prep descriptors as whole words.
   for (const d of PREP_DESCRIPTORS) {
     n = n.replace(new RegExp(`(^|[,\\s])${d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([,\\s]|$)`, "gi"), " ");
@@ -892,9 +1010,20 @@ function isSectionHeader(raw) {
   const n = normalize(raw).replace(/[:]+$/, "").trim();
   if (!n) return false;
   if (SECTION_HEADERS.has(n)) return true;
+  // Pattern headers: "<x> marinade", "<x> marination", "<x> seasoning", "<x> sauce base".
+  if (/\b(marinade|marination|seasoning)$/.test(n) && n.split(/\s+/).length <= 3) return true;
+  // "for <something>" with no quantity is almost always a header.
+  if (/^for\s+\w/.test(n) && n.split(/\s+/).length <= 4 && !/\d/.test(n)) return true;
+  // "<x> to size" / "to taste" style trailing-instruction-only lines.
+  if (/\bto (size|taste|serve|garnish)$/.test(n)) return true;
   // A short line ending in a colon in the original is a header ("Sauce:").
   if (/:\s*$/.test(String(raw)) && String(raw).trim().split(/\s+/).length <= 4) return true;
   return false;
+}
+
+// True if this ingredient should be omitted from shopping entirely (ubiquitous).
+function isNeverBuy(name) {
+  return NEVER_BUY.has(canonicalName(name)) || NEVER_BUY.has(normalize(name));
 }
 
 function mergeKey(name) {
@@ -930,6 +1059,7 @@ function generateShoppingList(plan, recipes, pantry, excludes = [], activePerson
       for (const ing of (recipe.ingredients || [])) {
         if (omittedSet.has(normalize(ing.name))) continue;
         if (isSectionHeader(ing.name)) continue; // drop stray headers
+        if (isNeverBuy(ing.name)) continue; // water etc. — never buy
         const key = mergeKey(ing.name);
         if (!key) continue;
         if (!needs[key]) needs[key] = { name: key, category: guessCategory(ing.name), families: {}, parts: {} };
@@ -3723,20 +3853,23 @@ function DataSection() {
 //      amount and the shopping list sums correctly.
 function cleanRecipes(arr) {
   if (!Array.isArray(arr)) return [];
-  const startsWithQty = (s) => /^\s*[\d.\/]+\s/.test(s);
+  const startsWithQty = (s) => /^\s*[\d.\/½⅓⅔¼¾⅛]+\s/.test(s);
+  const startsWithUnitWord = (s) => new RegExp(`^(${UNIT_WORD_ALTERNATION})\\b`, "i").test(s.trim());
   return arr.map(r => {
     if (!r || !Array.isArray(r.ingredients)) return r;
     let changed = false;
     const ingredients = r.ingredients.map(ing => {
       if (!ing || typeof ing.name !== "string") return ing;
       const stripped = stripArtifacts(ing.name);
-      // Re-segment only when qty was never captured (default 1, no unit) and the
-      // name still carries a leading number — i.e. a compound string from a bad
-      // paste. Never touch ingredients that already have a real qty/unit.
-      const looksCompound = (ing.qty == null || ing.qty === 1) && !ing.unit && startsWithQty(stripped);
+      // Re-parse when the name still carries a leading quantity, a leading unit
+      // word ("teaspoon cumin"), or qty was never captured — i.e. a compound
+      // string from an old paste. Re-parsing splits qty/unit/name properly and
+      // strips prep clauses. Don't touch entries that already look clean.
+      const looksCompound =
+        ((ing.qty == null || ing.qty === 1) && !ing.unit && (startsWithQty(stripped) || startsWithUnitWord(stripped)));
       if (looksCompound) {
         const parsed = parseIngredientLine(stripped);
-        if (parsed && (parsed.qty !== 1 || parsed.unit)) {
+        if (parsed && (parsed.qty !== 1 || parsed.unit || parsed.name !== normalize(stripped))) {
           changed = true;
           return { ...ing, qty: parsed.qty, unit: parsed.unit, name: parsed.name };
         }
@@ -3744,6 +3877,10 @@ function cleanRecipes(arr) {
       const cleaned = normalize(stripped);
       if (cleaned !== ing.name) { changed = true; return { ...ing, name: cleaned }; }
       return ing;
+    }).filter(ing => {
+      // Drop stored ingredients that are really section headers.
+      if (ing && typeof ing.name === "string" && isSectionHeader(ing.name)) { changed = true; return false; }
+      return true;
     });
     return changed ? { ...r, ingredients } : r;
   });
