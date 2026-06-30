@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, Component } from "react";
-import { normalizeIngredient, toWholeCount, canonicalize, unitInfo as nUnitInfo } from "./normalizer.js";
+import { normalizeIngredient, toWholeCount, canonicalize, unitInfo as nUnitInfo, setCustomUnits, getCustomUnitNames } from "./normalizer.js";
 import { ITEM_DB, SUB_UNIT, AMBIGUOUS_UNITS } from "./itemDb.js";
 
 // ============================================================
@@ -3790,7 +3790,7 @@ function SettingsTab({ settings, setSettings, people, setPeople, pantry, recipes
   return (
     <div>
       <div style={{ display:"flex", gap:4, marginBottom:14, flexWrap:"wrap" }}>
-        {[["people","People"],["preferences","Preferences"],["meals","Meals"],["ranges","Ranges"],["redlist","Red List"],["excludes","Excludes"],["boosts","Boosts"],["cooking","Cooking"],["data","Data"]].map(([k, l]) => (
+        {[["people","People"],["preferences","Preferences"],["meals","Meals"],["ranges","Ranges"],["redlist","Red List"],["excludes","Excludes"],["boosts","Boosts"],["units","Units"],["cooking","Cooking"],["data","Data"]].map(([k, l]) => (
           <Btn key={k} small variant={section===k?"primary":"ghost"} onClick={() => setSection(k)}>{l}</Btn>
         ))}
       </div>
@@ -3802,6 +3802,7 @@ function SettingsTab({ settings, setSettings, people, setPeople, pantry, recipes
       {section === "redlist" && <RedListSection redList={settings.redList} onChange={v => update("redList", v)} ingredientPool={ingredientPool} />}
       {section === "excludes" && <ExcludesSection excludes={settings.excludes} onChange={v => update("excludes", v)} people={people} ingredientPool={ingredientPool} />}
       {section === "boosts" && <BoostsSection boosts={settings.boosts} onChange={v => update("boosts", v)} ingredientPool={ingredientPool} />}
+      {section === "units" && <CustomUnitsSection customUnits={settings.customUnits || []} onChange={v => update("customUnits", v)} />}
       {section === "cooking" && <CookingSection settings={settings} update={update} />}
       {section === "data" && <DataSection />}
     </div>
@@ -4212,6 +4213,79 @@ function BoostsSection({ boosts, onChange, ingredientPool = [] }) {
   );
 }
 
+function CustomUnitsSection({ customUnits, onChange }) {
+  const [name, setName] = useState("");
+  const [amount, setAmount] = useState("");
+  const [baseUnit, setBaseUnit] = useState("g");
+  const [err, setErr] = useState("");
+
+  // Base units a custom unit can map to. Includes count ("pcs") per the design —
+  // e.g. "pair = 2 pcs". Built-ins only, so we never chain custom->custom.
+  const BASE_OPTIONS = [
+    { group: "Weight", items: [{ value:"g", label:"grams (g)" }, { value:"kg", label:"kilograms (kg)" }, { value:"oz", label:"ounces (oz)" }, { value:"lb", label:"pounds (lb)" }] },
+    { group: "Volume", items: [{ value:"ml", label:"milliliters (ml)" }, { value:"l", label:"liters (l)" }, { value:"tsp", label:"teaspoons (tsp)" }, { value:"tbsp", label:"tablespoons (tbsp)" }, { value:"cup", label:"cups" }] },
+    { group: "Count", items: [{ value:"pcs", label:"pieces (count)" }] },
+  ];
+  const BUILT_IN = new Set(["g","kg","oz","lb","lbs","ml","l","tsp","tbsp","cup","dozen","doz","dz","pair","pairs","pcs","pc","piece","each"]);
+
+  function add() {
+    const n = name.toLowerCase().trim();
+    const a = parseFloat(amount);
+    if (!n) { setErr("Enter a name for the unit."); return; }
+    if (BUILT_IN.has(n)) { setErr(`"${n}" is already a standard unit.`); return; }
+    if (customUnits.some(u => u.name.toLowerCase() === n)) { setErr(`"${n}" is already defined.`); return; }
+    if (!(a > 0)) { setErr("Enter how much one unit equals (a number above 0)."); return; }
+    setErr("");
+    onChange([...customUnits, { name: n, amount: a, baseUnit }]);
+    setName(""); setAmount("");
+  }
+
+  const baseLabel = (b) => { for (const g of BASE_OPTIONS) { const f = g.items.find(i => i.value === b); if (f) return f.label.replace(/\s*\(.*\)/, ""); } return b; };
+
+  return (
+    <div>
+      <SectionLabel>Custom measurements</SectionLabel>
+      <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:12, lineHeight:1.5 }}>
+        Define your own units by linking them to a standard one. A unit only saves once it's linked — that's what lets the app do the math. Example: a smidge = 3 g, so a recipe calling for "2 smidge" counts as 6 g.
+      </div>
+
+      {customUnits.length > 0 && (
+        <div style={{ marginBottom:14 }}>
+          {customUnits.map((u, i) => (
+            <div key={i} style={{ display:"flex", alignItems:"center", gap:8, padding:"8px 10px", background:COLORS.surface, borderRadius:7, marginBottom:6 }}>
+              <span style={{ fontSize:13, fontWeight:700, color:COLORS.text }}>1 {u.name}</span>
+              <span style={{ fontSize:12, color:COLORS.textSec }}>=</span>
+              <span style={{ fontSize:13, color:COLORS.text }}>{u.amount} {baseLabel(u.baseUnit)}</span>
+              <div style={{ flex:1 }} />
+              <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={() => onChange(customUnits.filter((_, j) => j !== i))}>Remove</Btn>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ background:"#fff", border:`1px solid ${COLORS.border}`, borderRadius:9, padding:12 }}>
+        <div style={{ display:"flex", gap:8, alignItems:"flex-end", flexWrap:"wrap" }}>
+          <div style={{ flex:"1 1 90px" }}>
+            <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:3 }}>Unit name</div>
+            <input value={name} onChange={e => { setName(e.target.value); setErr(""); }} placeholder="smidge" style={{ width:"100%", boxSizing:"border-box", padding:"8px 10px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13 }} />
+          </div>
+          <div style={{ fontSize:16, color:COLORS.textSec, paddingBottom:8 }}>=</div>
+          <div style={{ width:64 }}>
+            <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:3 }}>Amount</div>
+            <input value={amount} onChange={e => { setAmount(e.target.value); setErr(""); }} inputMode="decimal" placeholder="3" style={{ width:"100%", boxSizing:"border-box", padding:"8px 8px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13, textAlign:"center" }} />
+          </div>
+          <div style={{ flex:"1 1 110px", minWidth:110 }}>
+            <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:3 }}>Of (standard unit)</div>
+            <PickList value={baseUnit} onChange={setBaseUnit} options={BASE_OPTIONS} />
+          </div>
+        </div>
+        {err && <div style={{ fontSize:11, color:COLORS.red, marginTop:8 }}>{err}</div>}
+        <Btn small onClick={add} style={{ marginTop:10 }}>+ Add measurement</Btn>
+      </div>
+    </div>
+  );
+}
+
 function DataSection() {
   const importRef = useRef(null);
   function exportAll() {
@@ -4341,6 +4415,9 @@ const DEFAULT_SETTINGS = {
   excludes: [],
   boosts: [],
   maxOmissions: 2,
+  // User-defined measurements, e.g. { name:"smidge", amount:3, baseUnit:"g" }.
+  // Registered into the normalizer so recipes/pantry can use them.
+  customUnits: [],
 };
 
 const emptyPlan = () => {
@@ -4408,6 +4485,13 @@ function FirstRunSurvey({ settings, setSettings, onClose }) {
 
 export default function App() {
   const [tab, setTab] = useState("Plan");
+  // Register user-defined units BEFORE the first recipe normalization below
+  // (cleanRecipes normalizes on load), so custom units like "smidge" resolve
+  // from the very first parse. Read straight from storage for this one-time init.
+  useMemo(() => {
+    try { setCustomUnits((load("settings", DEFAULT_SETTINGS) || {}).customUnits || []); } catch {}
+    return null;
+  }, []);
   const [recipes, setRecipesRaw] = useState(() => cleanRecipes(dedupeById(load("recipes", []))));
   const [pantry, setPantryRaw] = useState(() => dedupeById(load("pantry", [])));
   const [plan, setPlanRaw] = useState(() => load("plan", emptyPlan()));
@@ -4434,7 +4518,13 @@ export default function App() {
     setPlanRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("plan", next); return next; });
   }, []);
   const setSettings = useCallback(v => {
-    setSettingsRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("settings", next); return next; });
+    setSettingsRaw(prev => {
+      const next = typeof v === "function" ? v(prev) : v;
+      save("settings", next);
+      // Keep the normalizer's custom-unit register in sync with edits.
+      try { setCustomUnits(next.customUnits || []); } catch {}
+      return next;
+    });
   }, []);
   const setDictionary = useCallback(v => {
     setDictionaryRaw(prev => { const next = typeof v === "function" ? v(prev) : v; save("dictionary", next); return next; });

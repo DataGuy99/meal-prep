@@ -30,13 +30,44 @@ const UNIT_CONV = {
   pairs: { family: "count", factor: 2 },
 };
 const PLAIN_COUNT_LABELS = new Set(["", "pc", "pcs", "piece", "pieces", "whole", "each", "ct", "count", "unit", "units", "head", "heads", "clove", "cloves", "stalk", "stalks", "slice", "slices", "can", "cans", "bag", "bags", "bottle", "bottles", "bunch", "bunches", "block", "blocks", "fillet", "fillets"]);
+const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 export function unitInfo(unit) {
   const u = (unit || "").toLowerCase().trim();
   if (UNIT_CONV[u]) return UNIT_CONV[u];
+  // User-defined custom units (e.g. "smidge" -> 3 g). Registered by the app via
+  // setCustomUnits(). Each maps to { family, factor } in base units so it slots
+  // straight into the same conversion math as built-in units.
+  if (_customUnits[u]) return _customUnits[u];
   if (PLAIN_COUNT_LABELS.has(u)) return { family: "count", factor: 1 };
   return { family: "count:" + u, factor: 1 };
 }
+
+// Module-level custom-unit register. The app calls setCustomUnits() on load and
+// whenever the user edits them in Settings. Shape: { smidge: {family,factor} }.
+let _customUnits = {};
+export function setCustomUnits(defs) {
+  const map = {};
+  for (const d of (defs || [])) {
+    if (!d || !d.name) continue;
+    const name = String(d.name).toLowerCase().trim();
+    if (!name || UNIT_CONV[name]) continue; // don't let custom override built-ins
+    const base = unitInfoBase(d.baseUnit);
+    if (!base) continue; // base must resolve to a known family
+    const amt = parseFloat(d.amount);
+    if (!(amt > 0)) continue;
+    map[name] = { family: base.family, factor: amt * base.factor };
+  }
+  _customUnits = map;
+}
+// Like unitInfo but only consults BUILT-IN units (avoids custom->custom cycles).
+function unitInfoBase(unit) {
+  const u = (unit || "").toLowerCase().trim();
+  if (UNIT_CONV[u]) return UNIT_CONV[u];
+  if (PLAIN_COUNT_LABELS.has(u)) return { family: "count", factor: 1 };
+  return null;
+}
+export function getCustomUnitNames() { return Object.keys(_customUnits); }
 
 // ---- quantity tokens (fractions, mixed numbers, ranges) ----
 const FRACTION_MAP = { "½": 0.5, "⅓": 1/3, "⅔": 2/3, "¼": 0.25, "¾": 0.75, "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875, "⅕": 0.2, "⅖": 0.4, "⅗": 0.6, "⅘": 0.8, "⅙": 1/6, "⅚": 5/6 };
@@ -266,6 +297,16 @@ export function normalizeIngredient(input, opts = {}) {
   let unit = "";
   const uw = rest.match(new RegExp(`^(${UNIT_WORD_ALTERNATION})\\b\\.?\\s+(.*)$`, "i"));
   if (uw) { unit = UNIT_WORD_MAP[uw[1].toLowerCase()] || ""; rest = uw[2]; }
+  else {
+    // Custom user-defined unit ("2 smidge salt"). Check after built-ins so a
+    // custom name can't shadow a real unit. Keep the custom name as the unit;
+    // unitInfo() knows its family/factor.
+    const customNames = Object.keys(_customUnits);
+    if (customNames.length) {
+      const cu = rest.match(new RegExp(`^(${customNames.map(escapeRe).join("|")})\\b\\.?\\s+(.*)$`, "i"));
+      if (cu) { unit = cu[1].toLowerCase(); rest = cu[2]; }
+    }
+  }
   rest = rest.replace(/^of\s+/i, "");
   // Strip leading measurement/size descriptors that aren't the item:
   // "2 inch cinnamon piece" -> "cinnamon piece", "whole cashew" -> "cashew".
