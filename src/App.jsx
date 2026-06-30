@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo, Component } from "react";
+import { normalizeIngredient, toWholeCount, canonicalize, unitInfo as nUnitInfo } from "./normalizer.js";
+import { ITEM_DB, SUB_UNIT, AMBIGUOUS_UNITS } from "./itemDb.js";
 
 // ============================================================
 // CONSTANTS
@@ -30,6 +32,14 @@ const SC = {
   cold: { bg: COLORS.coldBg, fg: COLORS.cold, label: "Cold" },
   frozen: { bg: COLORS.frozenBg, fg: COLORS.frozen, label: "Frozen" },
 };
+// Grouped unit options for the PickList unit pickers (fixed set — the app does
+// conversion math on these, so users pick from the list rather than add new).
+const UNIT_PICK_OPTIONS = [
+  { group: null, items: [{ value: "", label: "(count)" }, { value: "pcs", label: "pcs" }] },
+  { group: "Weight", items: ["g", "kg", "oz", "lb"] },
+  { group: "Volume", items: ["ml", "l", "tsp", "tbsp", "cup"] },
+  { group: "Count", items: ["dozen", "can", "bottle", "bag", "bunch", "head", "pack", "jar", "stalk", "slice", "block"] },
+];
 const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const MEALS = ["Breakfast","Lunch","Dinner"];
 const TABS = ["Recipes","Plan","Shop","Pantry","Settings"];
@@ -1043,10 +1053,14 @@ function mergeKeyLegacy(name) {
 }
 
 function generateShoppingList(plan, recipes, pantry, excludes = [], activePersonIds = null, maxOmissions = Infinity) {
-  // Bucket needs by canonical name + unit family. Within a family, sum in base
-  // units. Also record `parts` — each original ingredient that merged in — so
-  // the UI can expand a line to show its composition.
-  // needs[key] = { name, category, families: {fam: base}, parts: {fam: [{label, qty, unit}]} }
+  // Schema-based aggregation (Stage 2). Every ingredient is normalized to the
+  // structured form ONCE here, then bucketed by canonical `item`. Within an item
+  // we keep per-family base sums AND a grams-equivalent total (via the count<->
+  // weight bridge) so multi-unit messes (garlic x43 + 180g + 8tsp) collapse to
+  // ONE line. Composition records each distinct contributing part for the
+  // expandable breakdown.
+  // needs[item] = { item, display, category, soldAs, families:{fam:base},
+  //                 parts:[{label, qty, unit}], ambiguous }
   const needs = {};
   const now = Date.now();
   DAYS.forEach(d => MEALS.forEach(m => {
@@ -1056,76 +1070,153 @@ function generateShoppingList(plan, recipes, pantry, excludes = [], activePerson
       if (!recipe) continue;
       const qual = qualifyRecipe(recipe, excludes, activePersonIds, now, maxOmissions);
       const omittedSet = new Set(qual.omitted.map(n => normalize(n)));
-      for (const ing of (recipe.ingredients || [])) {
-        if (omittedSet.has(normalize(ing.name))) continue;
-        if (isSectionHeader(ing.name)) continue; // drop stray headers
-        if (isNeverBuy(ing.name)) continue; // water etc. — never buy
-        const key = mergeKey(ing.name);
-        if (!key) continue;
-        if (!needs[key]) needs[key] = { name: key, category: guessCategory(ing.name), families: {}, parts: {} };
-        const info = unitInfo(ing.unit);
-        const base = (ing.qty || 1) * info.factor;
-        needs[key].families[info.family] = (needs[key].families[info.family] || 0) + base;
-        // Record the original part for the expandable breakdown (only if it
-        // differs from the canonical name, so we don't show "onion: onion").
-        const origLabel = stripArtifacts(stripLeadingQty(ing.name));
-        if (!needs[key].parts[info.family]) needs[key].parts[info.family] = [];
-        needs[key].parts[info.family].push({
-          label: origLabel && normalize(origLabel) !== key ? origLabel : null,
-          qty: ing.qty || 1, unit: ing.unit || "",
-        });
+      for (const rawIng of (recipe.ingredients || [])) {
+        // Normalize on the fly (stored data may be legacy; we don't mutate it).
+        const ing = normalizeIngredient(rawIng);
+        if (!ing) continue;                       // header / empty
+        if (ing.neverBuy) continue;               // water etc.
+        if (omittedSet.has(normalize(rawIng.name || ing.item))) continue;
+        const key = ing.item;
+        if (!needs[key]) {
+          needs[key] = {
+            item: key, display: ing.itemDisplay || key, category: ing.category,
+            soldAs: ing.soldAs, families: {}, parts: [], ambiguous: ing.ambiguousUnit,
+          };
+        }
+        const dbk = ITEM_DB[key];
+        // A bare count (no unit) on a WEIGHT-sold item is almost always a "to
+        // taste" / "a pinch" artifact (recipe wrote "salt" with qty 1). Don't let
+        // it become a phantom "xN" line. Flag the item as needed; if any real
+        // measured amount exists, that's what shows. If ONLY bare counts exist,
+        // we show a single "to taste" line instead of a summed count.
+        // A bare count of exactly 1 (no unit) on a WEIGHT item is the classic
+        // "to taste" / "a pinch" artifact (recipe wrote just "salt"). But an
+        // explicit count >= 2 ("2 chicken thigh", "3 eggs") is a REAL quantity —
+        // keep it as a count line, don't fold it into "to taste".
+        const isBareCount = ing.family === "count" && !ing.unit && !ing.subUnitGrams;
+        const qtyVal = parseFloat(ing.qty) || 1;
+        if (ing.soldAs === "weight" && isBareCount && qtyVal <= 1) {
+          needs[key].toTaste = true;
+          needs[key].parts.push({ label: ing.itemDisplay, qty: ing.qty, unit: ing.unit, raw: ing.raw });
+          continue;
+        }
+        needs[key].families[ing.family] = (needs[key].families[ing.family] || 0) + ing.baseQty;
+        // Accumulate a grams-equivalent for count<->weight bridging. Use precise
+        // sub-unit weight (clove=5g) when known; else the item avg weight.
+        if (needs[key].gramsEquiv == null) needs[key].gramsEquiv = 0;
+        if (ing.family === "mass") {
+          needs[key].gramsEquiv += ing.baseQty;
+        } else if (ing.family === "count" && ing.subUnitGrams) {
+          needs[key].gramsEquiv += ing.baseQty * ing.subUnitGrams; // cloves * 5g
+        } else if (ing.family === "count" && dbk && dbk.avgG) {
+          needs[key].gramsEquiv += ing.baseQty * dbk.avgG;          // whole items * avg
+        } else {
+          // volume or unbridgeable — track separately so it isn't lost
+          if (!needs[key].unbridged) needs[key].unbridged = {};
+          needs[key].unbridged[ing.family] = (needs[key].unbridged[ing.family] || 0) + ing.baseQty;
+        }
+        needs[key].parts.push({ label: ing.itemDisplay, qty: ing.qty, unit: ing.unit, raw: ing.raw });
       }
     }
   }));
 
   const items = [];
   for (const [key, need] of Object.entries(needs)) {
-    // Match a pantry item by canonical name so "2 dozen eggs" offsets recipe eggs.
-    const pantryItem = pantry.find(p => mergeKey(p.name) === key);
+    const pantryItem = pantry.find(p => {
+      const pn = normalizeIngredient(p);
+      return pn && pn.item === key;
+    });
 
-    for (const [family, baseQty] of Object.entries(need.families)) {
-      let remaining = baseQty;
+    // Decide the unit to express this item in. Count-sold items try to show whole
+    // counts; weight-sold items show mass/volume. We compute a single combined
+    // amount by converting each family to the display family where possible.
+    const db = ITEM_DB[key];
+    const families = need.families;
+    const famNames = Object.keys(families);
+
+    if (need.soldAs === "count" && db && db.avgG) {
+      // Express the accumulated grams-equivalent as whole counts.
+      let grams = need.gramsEquiv || 0;
       let haveNote = "";
-
-      // Subtract what's already in the pantry. Count families unify (dozen vs
-      // singles), mass/volume convert within family.
       if (pantryItem && pantryItem.qty > 0) {
-        const pInfo = unitInfo(pantryItem.unit);
-        const bothCount = family.startsWith("count") && pInfo.family.startsWith("count");
-        if (pInfo.family === family || bothCount) {
-          const haveBase = pantryItem.qty * (bothCount && pInfo.family !== family ? 1 : pInfo.factor);
-          remaining -= haveBase;
-          haveNote = `have ${pantryItem.qty}${pantryItem.unit ? " " + pantryItem.unit : ""}`;
+        const pn = normalizeIngredient(pantryItem);
+        let pg = null;
+        if (pn.family === "mass") pg = pn.baseQty;
+        else if (pn.family === "count" && pn.subUnitGrams) pg = pn.baseQty * pn.subUnitGrams;
+        else if (pn.family === "count" && db.avgG) pg = pn.baseQty * db.avgG;
+        if (pg != null) { grams -= pg; haveNote = `have ${pantryItem.qty}${pantryItem.unit ? " " + pantryItem.unit : ""}`; }
+      }
+      if (grams > 0.01) {
+        const count = grams / db.avgG;
+        items.push(makeItem(need, Math.max(1, Math.round(count)), "", pantryItem, haveNote));
+      }
+      // Families that couldn't bridge (e.g. volume) show as separate lines.
+      // When the item ALSO emitted a primary count line above, two lines share
+      // the same headline name (e.g. garlic "×32" + garlic "8 tsp") and look
+      // like a duplicate. They aren't — they're different forms (whole cloves
+      // vs. measured/minced). Tag the secondary line with its form so the user
+      // sees they're distinct: "garlic — minced/measured (8 tsp)".
+      const emittedPrimaryCount = grams > 0.01;
+      for (const fam of Object.keys(need.unbridged || {})) {
+        const disp = prettyUnit(fam, need.unbridged[fam]);
+        if (disp.qty > 0.01) {
+          const formNote = emittedPrimaryCount ? "by volume" : "";
+          items.push(makeItem(need, round1(disp.qty), disp.unit, pantryItem, "", formNote));
         }
       }
-
-      if (remaining > 0.01) {
-        const disp = prettyUnit(family, remaining);
-        // Build composition: distinct original parts that merged into this line.
-        const rawParts = (need.parts[family] || []).filter(p => p.label);
-        const seen = new Set();
-        const composition = [];
-        for (const p of rawParts) {
-          const sig = p.label.toLowerCase() + "|" + p.qty + "|" + p.unit;
-          if (seen.has(sig)) continue;
-          seen.add(sig);
-          composition.push(p);
+    } else {
+      // Weight/volume item: per-family lines (usually just one), pantry-subtracted.
+      let emittedAny = false;
+      for (const fam of famNames) {
+        let remaining = families[fam];
+        let haveNote = "";
+        if (pantryItem && pantryItem.qty > 0) {
+          const pn = normalizeIngredient(pantryItem);
+          const bothCount = fam.startsWith("count") && pn.family.startsWith("count");
+          if (pn.family === fam || bothCount) {
+            remaining -= pn.baseQty;
+            haveNote = `have ${pantryItem.qty}${pantryItem.unit ? " " + pantryItem.unit : ""}`;
+          }
         }
-        items.push({
-          name: need.name,
-          qty: round1(disp.qty),
-          unit: disp.unit,
-          category: need.category,
-          store: pantryItem?.store || "",
-          checked: false,
-          source: "plan",
-          haveNote,
-          composition: composition.length > 1 ? composition : [],
-        });
+        if (remaining > 0.01) {
+          const disp = prettyUnit(fam, remaining);
+          items.push(makeItem(need, round1(disp.qty), disp.unit, pantryItem, haveNote));
+          emittedAny = true;
+        }
+      }
+      // If the item only ever appeared as bare "to taste" counts (no measured
+      // amount), show a single "to taste" line instead of a meaningless count.
+      if (!emittedAny && need.toTaste) {
+        items.push(makeItem(need, null, "to taste", pantryItem, ""));
       }
     }
   }
   return items;
+
+  // Build a shopping item with composition (distinct contributing parts).
+  function makeItem(need, qty, unit, pantryItem, haveNote, formNote) {
+    const seen = new Set();
+    const composition = [];
+    for (const p of need.parts) {
+      const sig = (p.label || "").toLowerCase() + "|" + p.qty + "|" + p.unit;
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      composition.push(p);
+    }
+    return {
+      name: need.display,
+      item: need.item,
+      qty, unit,
+      category: need.category,
+      store: pantryItem?.store || "",
+      checked: false,
+      source: "plan",
+      haveNote: haveNote || "",
+      formNote: formNote || "",
+      ambiguous: need.ambiguous || false,
+      composition: composition.length > 1 ? composition : [],
+    };
+  }
 }
 
 function getFloorItems(pantry) {
@@ -1145,17 +1236,23 @@ function getFloorItems(pantry) {
 // prevents the floor double-add (an item that's both plan-needed and below
 // floor appears once). Manual items are passed through untouched.
 function buildUnifiedList(plan, recipes, pantry, excludes = [], activePersonIds = null, maxOmissions = Infinity) {
-  // Collect plan needs in base units per (name, family).
+  // Collect plan needs — already normalized + merged by generateShoppingList.
   const planItems = generateShoppingList(plan, recipes, pantry, excludes, activePersonIds, maxOmissions);
   const floorItems = getFloorItems(pantry);
 
-  // Key each by name|family. For floor items, derive their family from unit.
-  const merged = {}; // key -> item with baseQty for comparison
-  const keyOf = (name, unit) => `${mergeKey(name)}|${unitInfo(unit).family}`;
+  // Key by the canonical `item` when present (from the normalizer) so we DON'T
+  // re-split what the generator already merged. Floor items (no `item`) fall back
+  // to a normalized name. Family still separates genuinely different forms.
+  const merged = {};
+  const keyOf = (item) => {
+    const base = item.item || normalizeIngredient({ name: item.name, unit: item.unit, qty: item.qty })?.item || normalize(item.name);
+    const fam = nUnitInfo(item.unit).family;
+    return `${base}|${fam}`;
+  };
 
   function consider(item, reason) {
-    const k = keyOf(item.name, item.unit);
-    const info = unitInfo(item.unit);
+    const k = keyOf(item);
+    const info = nUnitInfo(item.unit);
     const base = (parseFloat(item.qty) || 0) * info.factor;
     if (!merged[k]) {
       merged[k] = { ...item, _base: base, _family: info.family, sources: [item.source] };
@@ -1163,24 +1260,30 @@ function buildUnifiedList(plan, recipes, pantry, excludes = [], activePersonIds 
     } else {
       const m = merged[k];
       if (!m.sources.includes(item.source)) m.sources.push(item.source);
-      // Take the larger need (max), re-deriving display from the winning base.
+      // Plan items are already correctly computed; only floor items should be
+      // able to RAISE the quantity (the floor needs more than the plan). Never
+      // overwrite a plan item's display from a floor re-derivation downward.
       if (base > m._base) {
         m._base = base;
-        const disp = prettyUnit(info.family, base);
-        m.qty = round1(disp.qty);
-        m.unit = disp.unit;
+        // Preserve the richer plan display (counts/composition) if this is the
+        // same item; only swap to a plain display when the incoming wins on need.
+        if (!m.composition || m.composition.length === 0) {
+          const disp = prettyUnit(info.family, base);
+          m.qty = round1(disp.qty);
+          m.unit = disp.unit;
+        }
       }
-      // Prefer a store hint if we don't have one.
       if (!m.store && item.store) m.store = item.store;
-      // Keep a floor reason if present (explains why it's here beyond the plan).
       if (reason && !m.reason) m.reason = reason;
+      // Carry composition/ambiguous forward if the kept item lacked them.
+      if ((!m.composition || !m.composition.length) && item.composition && item.composition.length) m.composition = item.composition;
+      if (item.ambiguous && !m.ambiguous) m.ambiguous = true;
     }
   }
 
   planItems.forEach(it => consider(it, null));
   floorItems.forEach(it => consider(it, it.reason));
 
-  // Strip internal fields.
   return Object.values(merged).map(({ _base, _family, ...rest }) => rest);
 }
 
@@ -1355,7 +1458,52 @@ const SectionLabel = ({ children }) => (
   <div style={{ fontSize:11, fontWeight:700, textTransform:"uppercase", letterSpacing:1.2, color:COLORS.textSec, marginBottom:8, marginTop:16 }}>{children}</div>
 );
 
-const Combobox = ({ options, value, onChange, placeholder, multi, selected = [] }) => {
+// ---- Global in-app dialog system (replaces native confirm()/alert()) ----
+// Any code can call showConfirm({...}) / showAlert({...}) and a styled modal
+// appears (mounted once via <DialogHost/> at the app root). showConfirm returns
+// a Promise<boolean>; showAlert returns Promise<void>.
+let _dialogSub = null;
+let _dialogResolve = null;
+function _emitDialog(cfg) {
+  return new Promise(resolve => {
+    _dialogResolve = resolve;
+    if (_dialogSub) _dialogSub(cfg);
+  });
+}
+function showConfirm({ title, message, confirmText = "OK", cancelText = "Cancel", danger = false }) {
+  return _emitDialog({ kind: "confirm", title, message, confirmText, cancelText, danger });
+}
+function showAlert({ title, message, confirmText = "OK" }) {
+  return _emitDialog({ kind: "alert", title, message, confirmText });
+}
+function DialogHost() {
+  const [cfg, setCfg] = useState(null);
+  useEffect(() => { _dialogSub = setCfg; return () => { _dialogSub = null; }; }, []);
+  if (!cfg) return null;
+  const close = (result) => { setCfg(null); if (_dialogResolve) { _dialogResolve(result); _dialogResolve = null; } };
+  const accent = cfg.danger ? COLORS.red : COLORS.primary;
+  return (
+    <div onClick={() => close(cfg.kind === "confirm" ? false : undefined)}
+         style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100, padding:24 }}>
+      <div onClick={e => e.stopPropagation()}
+           style={{ background:"#fff", borderRadius:14, maxWidth:380, width:"100%", boxShadow:"0 12px 40px rgba(0,0,0,0.25)", overflow:"hidden" }}>
+        <div style={{ height:4, background:accent }} />
+        <div style={{ padding:"18px 20px 20px" }}>
+          {cfg.title && <div style={{ fontSize:16, fontWeight:700, color:COLORS.text, marginBottom:8 }}>{cfg.title}</div>}
+          <div style={{ fontSize:14, color:COLORS.textSec, lineHeight:1.5, whiteSpace:"pre-line" }}>{cfg.message}</div>
+          <div style={{ display:"flex", gap:8, justifyContent:"flex-end", marginTop:20 }}>
+            {cfg.kind === "confirm" && (
+              <Btn variant="ghost" onClick={() => close(false)}>{cfg.cancelText}</Btn>
+            )}
+            <Btn variant={cfg.danger ? "danger" : "primary"} onClick={() => close(true)}>{cfg.confirmText}</Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const Combobox = ({ options, value, onChange, placeholder, multi, selected = [], noAdd = false }) => {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const ref = useRef();
@@ -1376,7 +1524,7 @@ const Combobox = ({ options, value, onChange, placeholder, multi, selected = [] 
         {open && (
           <div style={{ position:"absolute", top:"100%", left:0, right:0, maxHeight:160, overflowY:"auto", background:"#fff", border:`1px solid ${COLORS.border}`, borderRadius:6, marginTop:2, zIndex:10, boxShadow:"0 4px 12px rgba(0,0,0,0.08)" }}>
             {filtered.map(o => <div key={o} onClick={() => { onChange([...selected, o]); setSearch(""); }} style={{ padding:"8px 10px", cursor:"pointer", fontSize:13 }}>{o}</div>)}
-            {filtered.length === 0 && search && <div onClick={() => { onChange([...selected, search.toLowerCase().trim()]); setSearch(""); }} style={{ padding:"8px 10px", cursor:"pointer", fontSize:13, color:COLORS.primary, fontWeight:600 }}>+ Add "{search.toLowerCase().trim()}"</div>}
+            {filtered.length === 0 && search && !noAdd && <div onClick={() => { onChange([...selected, search.toLowerCase().trim()]); setSearch(""); }} style={{ padding:"8px 10px", cursor:"pointer", fontSize:13, color:COLORS.primary, fontWeight:600 }}>+ Add "{search.toLowerCase().trim()}"</div>}
           </div>
         )}
       </div>
@@ -1389,7 +1537,78 @@ const Combobox = ({ options, value, onChange, placeholder, multi, selected = [] 
       {open && (
         <div style={{ position:"absolute", top:"100%", left:0, right:0, maxHeight:160, overflowY:"auto", background:"#fff", border:`1px solid ${COLORS.border}`, borderRadius:6, marginTop:2, zIndex:10, boxShadow:"0 4px 12px rgba(0,0,0,0.08)" }}>
           {filtered.map(o => <div key={o} onClick={() => { onChange(o); setOpen(false); setSearch(""); }} style={{ padding:"8px 10px", cursor:"pointer", fontSize:13, background:o===value?COLORS.surface:"transparent" }}>{o}</div>)}
-          {filtered.length === 0 && search && <div onClick={() => { onChange(search.toLowerCase().trim()); setOpen(false); setSearch(""); }} style={{ padding:"8px 10px", cursor:"pointer", fontSize:13, color:COLORS.primary, fontWeight:600 }}>+ Add "{search.toLowerCase().trim()}"</div>}
+          {filtered.length === 0 && search && !noAdd && <div onClick={() => { onChange(search.toLowerCase().trim()); setOpen(false); setSearch(""); }} style={{ padding:"8px 10px", cursor:"pointer", fontSize:13, color:COLORS.primary, fontWeight:600 }}>+ Add "{search.toLowerCase().trim()}"</div>}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Light-themed, searchable single-select to replace native <select> (which the
+// OS renders as an ugly full-screen dark sheet). Matches the app's look.
+// - options: array of strings OR { value, label } OR { group, items:[...] } for sections
+// - allowAdd: typing a value not in the list offers "+ Add ..." (tags only)
+const PickList = ({ options, value, onChange, placeholder = "Select…", allowAdd = false, style, accent = false }) => {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const ref = useRef();
+  useEffect(() => { const h = e => { if (ref.current && !ref.current.contains(e.target)) { setOpen(false); setSearch(""); } }; document.addEventListener("mousedown", h); return () => document.removeEventListener("mousedown", h); }, []);
+
+  const groups = [];
+  const flat = [];
+  for (const o of options) {
+    if (o && typeof o === "object" && Array.isArray(o.items)) {
+      const items = o.items.map(it => (typeof it === "object" ? it : { value: it, label: it }));
+      groups.push({ group: o.group, items });
+      items.forEach(it => flat.push({ ...it, group: o.group }));
+    } else {
+      const it = typeof o === "object" ? o : { value: o, label: o };
+      groups.push({ group: null, items: [it] });
+      flat.push(it);
+    }
+  }
+  const selectedLabel = flat.find(o => o.value === value)?.label ?? value ?? "";
+  const q = search.toLowerCase().trim();
+  const match = (it) => it.label.toLowerCase().includes(q);
+  const anyMatch = flat.some(match);
+
+  return (
+    <div ref={ref} style={{ position:"relative", width:"100%" }}>
+      <div onClick={() => { setOpen(o => !o); setSearch(""); }}
+           style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:6, padding:"8px 10px", borderRadius:6, border:`1.5px solid ${accent ? COLORS.primary : COLORS.border}`, fontSize:13, background:"#fff", cursor:"pointer", color:accent ? COLORS.primary : COLORS.text, fontWeight:accent ? 600 : 400, boxSizing:"border-box", ...style }}>
+        <span style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{selectedLabel || placeholder}</span>
+        <span style={{ fontSize:10, color:COLORS.textSec, flexShrink:0 }}>▾</span>
+      </div>
+      {open && (
+        <div style={{ position:"absolute", top:"100%", left:0, right:0, maxHeight:260, overflowY:"auto", background:"#fff", border:`1px solid ${COLORS.border}`, borderRadius:8, marginTop:3, zIndex:30, boxShadow:"0 6px 20px rgba(0,0,0,0.12)" }}>
+          <div style={{ position:"sticky", top:0, background:"#fff", padding:6, borderBottom:`1px solid ${COLORS.border}` }}>
+            <input autoFocus value={search} onChange={e => setSearch(e.target.value)} placeholder="Type to filter…"
+                   style={{ width:"100%", boxSizing:"border-box", padding:"6px 8px", borderRadius:5, border:`1px solid ${COLORS.border}`, fontSize:13, outline:"none" }} />
+          </div>
+          {groups.map((g, gi) => {
+            const items = g.items.filter(match);
+            if (items.length === 0) return null;
+            return (
+              <div key={gi}>
+                {g.group && <div style={{ fontSize:10, fontWeight:700, textTransform:"uppercase", letterSpacing:0.8, color:COLORS.textSec, padding:"6px 10px 2px" }}>{g.group}</div>}
+                {items.map(it => (
+                  <div key={it.value} onClick={() => { onChange(it.value); setOpen(false); setSearch(""); }}
+                       style={{ padding:"9px 10px", cursor:"pointer", fontSize:13, fontWeight:it.value===value?700:400, color:it.value===value?COLORS.primary:COLORS.text, background:it.value===value?COLORS.surface:"transparent" }}>
+                    {it.label}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+          {allowAdd && q && !anyMatch && (
+            <div onClick={() => { onChange(q); setOpen(false); setSearch(""); }}
+                 style={{ padding:"9px 10px", cursor:"pointer", fontSize:13, color:COLORS.primary, fontWeight:600, borderTop:`1px solid ${COLORS.border}` }}>
+              + Add "{q}"
+            </div>
+          )}
+          {!anyMatch && !(allowAdd && q) && (
+            <div style={{ padding:"10px", fontSize:12, color:COLORS.textSec, textAlign:"center" }}>No matches</div>
+          )}
         </div>
       )}
     </div>
@@ -1448,6 +1667,8 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
   const [mealFilter, setMealFilter] = useState("all");    // all | breakfast | lunch | dinner
   const [expandedId, setExpandedId] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
+  const [reviewItems, setReviewItems] = useState(null); // null = closed; array = reviewing parsed ingredients
+  const [reviewExpanded, setReviewExpanded] = useState({}); // review row idx -> expanded bool
   const [editId, setEditId] = useState(null); // recipe id being edited, or null for new
   const [addForm, setAddForm] = useState({ name:"", tags:[], mealTags:[], servings:4, slotsMin:2, slotsMax:4, stars:3, essentialText:"", secondaryText:"", instructions:"", url:"", role:"main" });
   const formRef = useRef(null);
@@ -1464,9 +1685,16 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
     if (tagFilter !== "all" && !tagOptions.includes(tagFilter)) setTagFilter("all");
   }, [tagOptions, tagFilter]);
 
+  // A recipe "needs review" if any ingredient is flagged uncertain (URL,
+  // run-on, unknown item, etc.) AND the recipe hasn't been confirmed yet.
+  // These are typically imported recipes that never went through entry-review.
+  const recipeNeedsReview = (r) => (r.ingredients || []).some(i => i && i.uncertain && i.confirmed !== true);
+  const reviewCount = recipes.filter(recipeNeedsReview).length;
+
   const filtered = recipes.filter(r => {
     if (filter === "favorites" && !(r.stars >= 4)) return false;
     if (filter === "quarantine" && !r.quarantine) return false;
+    if (filter === "review" && !recipeNeedsReview(r)) return false;
     if (roleFilter !== "all" && (r.role || "main") !== roleFilter) return false;
     if (tagFilter !== "all" && !(r.tags || []).includes(tagFilter)) return false;
     if (mealFilter !== "all" && !(r.mealTags || []).includes(mealFilter)) return false;
@@ -1514,8 +1742,9 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
     return ingredients
       .filter(i => (i.tier || "essential") === tier)
       .map(i => {
+        const label = i.itemDisplay || i.item || i.name || "";
         const showQty = i.qty && (i.qty !== 1 || i.unit);
-        return `${showQty ? i.qty + " " : ""}${i.unit ? i.unit + " " : ""}${i.name}`.trim();
+        return `${showQty ? i.qty + " " : ""}${i.unit ? i.unit + " " : ""}${label}`.trim();
       })
       .join("\n");
   }
@@ -1540,19 +1769,58 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
     setShowAdd(false);
     setEditId(null);
     setAddForm(blankForm);
+    setReviewItems(null);
+    setReviewExpanded({});
   }
 
-  function saveRecipe() {
-    const parseTier = (text, tier) => text.split("\n").map(parseIngredientLine).filter(Boolean)
-      .map(ing => ({ ...ing, name: findMatch(ing.name, dictionary), tier }));
-    const essentialIngs = parseTier(addForm.essentialText, "essential");
-    const secondaryIngs = parseTier(addForm.secondaryText, "secondary");
-    const newIngs = [...essentialIngs, ...secondaryIngs];
-    const newDict = [...new Set([...dictionary, ...newIngs.map(i => i.name)])];
+  // Stage 3: instead of saving immediately, parse the pasted ingredients into the
+  // schema and open the review popup. The user confirms/corrects, then commitRecipe
+  // does the actual save with confirmed:true.
+  function openReview() {
+    const parseTier = (text, tier) =>
+      String(text || "").split("\n").map(line => normalizeIngredient(line, { tier })).filter(Boolean);
+    const items = [...parseTier(addForm.essentialText, "essential"), ...parseTier(addForm.secondaryText, "secondary")];
+    if (items.length === 0) { saveRecipeRaw([]); return; } // nothing to review
+    setReviewItems(items);
+    setReviewExpanded({});
+  }
+
+  // Update one reviewed ingredient (from the expand-edit fields).
+  function updateReviewItem(idx, patch) {
+    setReviewItems(prev => prev.map((it, i) => {
+      if (i !== idx) return it;
+      const merged = { ...it, ...patch };
+      // Re-derive family/baseQty if unit changed; re-canonicalize if item text changed.
+      if (patch.unit !== undefined || patch.item !== undefined) {
+        const info = nUnitInfo(merged.unit);
+        merged.family = info.family.startsWith("count") ? "count" : info.family;
+        merged.baseQty = (parseFloat(merged.qty) || 1) * info.factor;
+      }
+      if (patch.qty !== undefined) {
+        const info = nUnitInfo(merged.unit);
+        merged.baseQty = (parseFloat(merged.qty) || 1) * info.factor;
+      }
+      return merged;
+    }));
+  }
+
+  function removeReviewItem(idx) {
+    setReviewItems(prev => prev.filter((_, i) => i !== idx));
+  }
+
+  // Confirm the review and save the recipe with all ingredients marked confirmed.
+  function commitReview() {
+    const confirmed = reviewItems.map(it => ({ ...it, confirmed: true }));
+    saveRecipeRaw(confirmed);
+    setReviewItems(null);
+  }
+
+  // The actual save (was saveRecipe). Takes the final ingredient objects.
+  function saveRecipeRaw(newIngs) {
+    const newDict = [...new Set([...dictionary, ...newIngs.map(i => i.item || i.name)])];
     setDictionary(newDict);
 
-    // Check red list
-    const redHits = newIngs.filter(ing => settings.redList.some(rl => normalize(rl) === normalize(ing.name)));
+    const redHits = newIngs.filter(ing => settings.redList.some(rl => normalize(rl) === normalize(ing.item || ing.name)));
     const isQ = redHits.length > 0;
 
     const core = {
@@ -1563,11 +1831,10 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
       instructions: addForm.instructions.trim(),
       url: addForm.url.trim(),
       role: addForm.role || "main",
-      quarantineItems: redHits.map(r => ({ ingredient: r.name, sub: "" })),
+      quarantineItems: redHits.map(r => ({ ingredient: r.item || r.name, sub: "" })),
     };
 
     if (editId) {
-      // Update existing — preserve usage history, dates, shelving.
       setRecipes(prev => prev.map(r => r.id === editId ? { ...r, ...core } : r));
     } else {
       setRecipes(prev => [...prev, {
@@ -1578,7 +1845,12 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
     closeForm();
   }
 
-  function deleteRecipe(id) { setRecipes(prev => prev.filter(r => r.id !== id)); }
+  function deleteRecipe(id) {
+    const r = recipes.find(x => x.id === id);
+    showConfirm({ title: "Delete recipe?", message: `"${r?.name || "This recipe"}" will be permanently removed. This can't be undone.`, confirmText: "Delete", danger: true }).then(ok => {
+      if (ok) setRecipes(prev => prev.filter(r => r.id !== id));
+    });
+  }
 
   function resolveQuarantine(recipeId, ingredient, sub) {
     if (!sub.trim()) return;
@@ -1596,7 +1868,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
   return (
     <div>
       <Notif notifications={[...quarNotifs, ...freqNotifs]} />
-      {recipes.length > 0 && (
+      {(recipes.length > 0 || showAdd) && (
         <>
           <div style={{ display:"flex", gap:6, marginBottom:8, flexWrap:"wrap" }}>
             {["all","favorites","quarantine"].map(f => (
@@ -1605,6 +1877,22 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
               </Btn>
             ))}
           </div>
+          {reviewCount > 0 && filter !== "review" && (
+            <div onClick={() => setFilter("review")}
+                 style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 12px", marginBottom:10, background:`${COLORS.gold}14`, border:`1px solid ${COLORS.gold}55`, borderRadius:8, cursor:"pointer" }}>
+              <span style={{ fontSize:16 }}>⚠️</span>
+              <div style={{ flex:1, fontSize:12.5, color:COLORS.text, lineHeight:1.4 }}>
+                <b>{reviewCount} recipe{reviewCount>1?"s":""} need{reviewCount>1?"":"s"} review.</b> Some ingredients look off (links, typos, or run-on text). Tap to see them, then edit to fix.
+              </div>
+              <span style={{ fontSize:13, color:COLORS.gold, fontWeight:700, flexShrink:0 }}>Review →</span>
+            </div>
+          )}
+          {filter === "review" && (
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:8, padding:"8px 12px", marginBottom:10, background:`${COLORS.gold}14`, border:`1px solid ${COLORS.gold}55`, borderRadius:8 }}>
+              <span style={{ fontSize:12.5, color:COLORS.text }}>Showing {reviewCount} recipe{reviewCount>1?"s":""} with flagged ingredients. Open one and tap <b>Edit</b> to fix.</span>
+              <Btn small variant="ghost" onClick={() => setFilter("all")}>Done</Btn>
+            </div>
+          )}
           <div style={{ display:"flex", gap:8, marginBottom:14, alignItems:"center" }}>
             <div style={{ flex:1, position:"relative" }}>
               <span style={{ position:"absolute", left:10, top:"50%", transform:"translateY(-50%)", fontSize:13, color:COLORS.textSec, pointerEvents:"none" }}>🔍</span>
@@ -1614,21 +1902,18 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
             <Btn small variant={grouped?"primary":"ghost"} onClick={() => setGrouped(g => !g)} title="Group by category">⊞ Group</Btn>
           </div>
           <div style={{ display:"flex", gap:6, marginBottom:14, flexWrap:"wrap" }}>
-            <select value={roleFilter} onChange={e => setRoleFilter(e.target.value)} style={{ flex:"1 1 auto", minWidth:90, padding:"7px 8px", borderRadius:6, border:`1.5px solid ${roleFilter!=="all"?COLORS.primary:COLORS.border}`, fontSize:12, background:"#fff", color:roleFilter!=="all"?COLORS.primary:COLORS.text, fontWeight:roleFilter!=="all"?600:400 }}>
-              <option value="all">All dishes</option>
-              <option value="main">Mains only</option>
-              <option value="side">Sides only</option>
-            </select>
-            <select value={tagFilter} onChange={e => setTagFilter(e.target.value)} disabled={tagOptions.length===0} style={{ flex:"1 1 auto", minWidth:90, padding:"7px 8px", borderRadius:6, border:`1.5px solid ${tagFilter!=="all"?COLORS.primary:COLORS.border}`, fontSize:12, background:"#fff", color:tagFilter!=="all"?COLORS.primary:COLORS.text, fontWeight:tagFilter!=="all"?600:400 }}>
-              <option value="all">Any tag</option>
-              {tagOptions.map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
-            <select value={mealFilter} onChange={e => setMealFilter(e.target.value)} style={{ flex:"1 1 auto", minWidth:90, padding:"7px 8px", borderRadius:6, border:`1.5px solid ${mealFilter!=="all"?COLORS.primary:COLORS.border}`, fontSize:12, background:"#fff", color:mealFilter!=="all"?COLORS.primary:COLORS.text, fontWeight:mealFilter!=="all"?600:400 }}>
-              <option value="all">Any meal</option>
-              <option value="breakfast">Breakfast</option>
-              <option value="lunch">Lunch</option>
-              <option value="dinner">Dinner</option>
-            </select>
+            <div style={{ flex:"1 1 auto", minWidth:90 }}>
+              <PickList value={roleFilter} accent={roleFilter!=="all"} onChange={setRoleFilter}
+                options={[{ value:"all", label:"All dishes" }, { value:"main", label:"Mains only" }, { value:"side", label:"Sides only" }]} />
+            </div>
+            <div style={{ flex:"1 1 auto", minWidth:90 }}>
+              <PickList value={tagFilter} accent={tagFilter!=="all"} onChange={setTagFilter}
+                options={[{ value:"all", label:"Any tag" }, ...tagOptions.map(t => ({ value:t, label:t }))]} />
+            </div>
+            <div style={{ flex:"1 1 auto", minWidth:90 }}>
+              <PickList value={mealFilter} accent={mealFilter!=="all"} onChange={setMealFilter}
+                options={[{ value:"all", label:"Any meal" }, { value:"breakfast", label:"Breakfast" }, { value:"lunch", label:"Lunch" }, { value:"dinner", label:"Dinner" }]} />
+            </div>
             {(roleFilter!=="all" || tagFilter!=="all" || mealFilter!=="all") && (
               <Btn small variant="ghost" onClick={() => { setRoleFilter("all"); setTagFilter("all"); setMealFilter("all"); }}>Clear</Btn>
             )}
@@ -1666,7 +1951,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
               </div>
               <div>
                 <div style={{ fontSize:11, color:COLORS.textSec, marginBottom:3, fontWeight:600 }}>Meal suitability</div>
-                <Combobox multi options={["breakfast","lunch","dinner"]} placeholder="breakfast, lunch, dinner..." selected={addForm.mealTags} onChange={v => setAddForm(p => ({ ...p, mealTags: v }))} />
+                <Combobox multi noAdd options={["breakfast","lunch","dinner"]} placeholder="breakfast, lunch, dinner..." selected={addForm.mealTags} onChange={v => setAddForm(p => ({ ...p, mealTags: v }))} />
               </div>
               <div style={{ display:"flex", gap:8 }}>
                 <div style={{ flex:1 }}>
@@ -1707,7 +1992,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
                 <input type="url" inputMode="url" placeholder="https://..." value={addForm.url} onChange={e => setAddForm(p => ({ ...p, url: e.target.value }))} style={{ width:"100%", boxSizing:"border-box", padding:"8px 10px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13 }} />
               </div>
               <div style={{ display:"flex", gap:8 }}>
-                <Btn style={{ flex:1 }} onClick={saveRecipe} disabled={!addForm.name.trim() || !addForm.essentialText.trim()}>{editId ? "Save Changes" : "Save Recipe"}</Btn>
+                <Btn style={{ flex:1 }} onClick={openReview} disabled={!addForm.name.trim() || !addForm.essentialText.trim()}>{editId ? "Review & Save" : "Review & Save"}</Btn>
                 <Btn variant="ghost" onClick={closeForm}>Cancel</Btn>
               </div>
             </div>
@@ -1724,7 +2009,7 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
           <div style={{ fontSize:13, color:COLORS.textSec, marginBottom:18, lineHeight:1.45 }}>
             Recipes are the building blocks — once you've added a few, the planner can build meal plans and shopping lists for you.
           </div>
-          <Btn onClick={() => setShowAdd(true)} style={{ width:"100%" }}>+ Add a recipe</Btn>
+          <Btn onClick={() => { setEditId(null); setAddForm(blankForm); setShowAdd(true); }} style={{ width:"100%" }}>+ Add a recipe</Btn>
         </div>
       )}
       {(() => {
@@ -1812,10 +2097,14 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
                 </div>
                 {(() => {
                   const renderIng = (ing, idx) => {
-                    const isRed = settings.redList.some(rl => normalize(rl) === normalize(ing.name));
+                    const label = ing.itemDisplay || ing.item || ing.name;
+                    const isRed = settings.redList.some(rl => normalize(rl) === normalize(ing.item || ing.name));
+                    const isUncertain = ing.uncertain && ing.confirmed !== true;
+                    const borderCol = isRed ? COLORS.quarantine : isUncertain ? COLORS.gold : (ing.confirmed===false ? COLORS.gold+"66" : COLORS.border);
+                    const bgCol = isRed ? COLORS.quarantineBg : isUncertain ? `${COLORS.gold}1a` : "#fff";
                     return (
-                      <span key={idx} style={{ fontSize:12, padding:"3px 8px", borderRadius:4, background:isRed?COLORS.quarantineBg:"#fff", border:`1px solid ${isRed?COLORS.quarantine:COLORS.border}`, color:isRed?COLORS.quarantine:COLORS.text, fontWeight:isRed?600:400 }}>
-                        {isRed && "⚠ "}{ing.qty > 0 && ing.qty !== 1 ? ing.qty + " " : ""}{ing.unit ? ing.unit + " " : ""}{stripArtifacts(ing.name)}
+                      <span key={idx} style={{ fontSize:12, padding:"3px 8px", borderRadius:4, background:bgCol, border:`1px solid ${borderCol}`, color:isRed?COLORS.quarantine:COLORS.text, fontWeight:(isRed||isUncertain)?600:400 }} title={isUncertain?ing.uncertainReason:(ing.confirmed===false?"unconfirmed — edit the recipe to review":undefined)}>
+                        {isRed && "⚠ "}{isUncertain && "⚠ "}{!isUncertain && ing.confirmed===false && "• "}{ing.qty > 0 && ing.qty !== 1 ? round1(ing.qty) + " " : ""}{ing.unit ? ing.unit + " " : ""}{label}
                       </span>
                     );
                   };
@@ -1874,6 +2163,79 @@ function RecipesTab({ recipes, setRecipes, settings, setSettings, dictionary, se
         }
         return <div style={{ display:"flex", flexDirection:"column", gap:8 }}>{filtered.map(renderCard)}</div>;
       })()}
+
+      {reviewItems && (
+        <div onClick={() => setReviewItems(null)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"flex-end", justifyContent:"center", zIndex:60 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background:"#fff", width:"100%", maxWidth:520, maxHeight:"88vh", borderRadius:"16px 16px 0 0", display:"flex", flexDirection:"column", overflow:"hidden" }}>
+            <div style={{ padding:"16px 18px 10px", borderBottom:`1px solid ${COLORS.border}` }}>
+              <div style={{ fontSize:16, fontWeight:700, color:COLORS.primary }}>Review ingredients</div>
+              <div style={{ fontSize:12, color:COLORS.textSec, marginTop:3, lineHeight:1.4 }}>
+                {reviewItems.filter(i => i.uncertain).length > 0
+                  ? <>Check the <span style={{ color:COLORS.gold, fontWeight:700 }}>flagged</span> items below — tap any row to edit. The rest look good.</>
+                  : <>These all parsed cleanly. Tap any row to adjust before saving.</>}
+              </div>
+            </div>
+            <div style={{ overflowY:"auto", padding:"8px 12px", flex:1 }}>
+              {reviewItems.map((it, idx) => {
+                const expanded = reviewExpanded[idx];
+                return (
+                  <div key={idx} style={{ border:`1px solid ${it.uncertain ? COLORS.gold : COLORS.border}`, borderRadius:8, marginBottom:6, background: it.uncertain ? `${COLORS.gold}0c` : "#fff" }}>
+                    <div onClick={() => setReviewExpanded(p => ({ ...p, [idx]: !p[idx] }))} style={{ display:"flex", alignItems:"center", gap:8, padding:"9px 11px", cursor:"pointer" }}>
+                      {it.uncertain && <span style={{ color:COLORS.gold, fontSize:14 }} title={it.uncertainReason}>⚠</span>}
+                      <span style={{ flex:1, fontSize:14, fontWeight:600 }}>
+                        {it.qty && it.qty !== 1 ? <span style={{ color:COLORS.textSec }}>{round1(it.qty)} </span> : null}
+                        {it.unit ? <span style={{ color:COLORS.textSec }}>{it.unit} </span> : null}
+                        {it.itemDisplay || it.item}
+                      </span>
+                      {it.tier === "secondary" && <span style={{ fontSize:10, color:COLORS.textSec, border:`1px solid ${COLORS.border}`, borderRadius:4, padding:"1px 5px" }}>opt</span>}
+                      <span style={{ fontSize:12, color:COLORS.textSec }}>{expanded ? "▴" : "▾"}</span>
+                    </div>
+                    {it.uncertain && !expanded && (
+                      <div style={{ fontSize:11, color:COLORS.gold, padding:"0 11px 8px 33px" }}>{it.uncertainReason}</div>
+                    )}
+                    {expanded && (
+                      <div style={{ padding:"4px 11px 11px", borderTop:`1px solid ${COLORS.border}` }}>
+                        <div style={{ display:"flex", gap:6, marginBottom:7, marginTop:8 }}>
+                          <div style={{ flex:"0 0 64px" }}>
+                            <div style={{ fontSize:10, color:COLORS.textSec, marginBottom:3 }}>Qty</div>
+                            <input value={it.qty} onChange={e => updateReviewItem(idx, { qty: e.target.value })} inputMode="decimal" style={{ width:"100%", boxSizing:"border-box", padding:"7px 8px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13 }} />
+                          </div>
+                          <div style={{ flex:"0 0 92px" }}>
+                            <div style={{ fontSize:10, color:COLORS.textSec, marginBottom:3 }}>Unit</div>
+                            <PickList value={it.unit} onChange={v => updateReviewItem(idx, { unit: v })} options={UNIT_PICK_OPTIONS} />
+                          </div>
+                          <div style={{ flex:1 }}>
+                            <div style={{ fontSize:10, color:COLORS.textSec, marginBottom:3 }}>Item</div>
+                            <input value={it.itemDisplay || it.item} onChange={e => updateReviewItem(idx, { item: normalize(e.target.value), itemDisplay: e.target.value })} style={{ width:"100%", boxSizing:"border-box", padding:"7px 8px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13 }} />
+                          </div>
+                        </div>
+                        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:8 }}>
+                          <div style={{ display:"flex", gap:5 }}>
+                            {[["essential","Essential"],["secondary","Optional"]].map(([val,label]) => (
+                              <Btn key={val} small variant={it.tier===val?"primary":"ghost"} style={{ padding:"3px 9px", fontSize:11 }} onClick={() => updateReviewItem(idx, { tier: val })}>{label}</Btn>
+                            ))}
+                          </div>
+                          <Btn small variant="ghost" style={{ padding:"3px 9px", fontSize:11, color:COLORS.red, borderColor:COLORS.red }} onClick={() => removeReviewItem(idx)}>Remove</Btn>
+                        </div>
+                        {it.raw && it.raw !== (it.itemDisplay || it.item) && (
+                          <div style={{ fontSize:10, color:COLORS.textSec, marginTop:7 }}>as written: "{it.raw}"</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {reviewItems.length === 0 && (
+                <div style={{ textAlign:"center", padding:"20px", fontSize:13, color:COLORS.textSec }}>All ingredients removed. Add some back or cancel.</div>
+              )}
+            </div>
+            <div style={{ padding:"10px 14px 14px", borderTop:`1px solid ${COLORS.border}`, display:"flex", gap:8 }}>
+              <Btn variant="ghost" onClick={() => setReviewItems(null)}>Back</Btn>
+              <Btn style={{ flex:1 }} onClick={commitReview} disabled={reviewItems.length === 0}>{editId ? "Save changes" : "Save recipe"} ({reviewItems.length})</Btn>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1935,31 +2297,28 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
       const linked = pantry.find(p => p.id === linkedId);
       if (linked) return linked;
     }
-    let m = pantry.find(p => normalize(p.name) === ni);
+    // 2. Canonical-item match (Stage 2b): normalize the recipe ingredient AND each
+    //    pantry item to their canonical `item` and match on that. This is the same
+    //    clean identity the shopping list merges by, so cook/shop agree.
+    const ing = normalizeIngredient(ingName);
+    const ingItem = ing ? ing.item : ni;
+    let m = pantry.find(p => {
+      const pn = normalizeIngredient(p);
+      return pn && pn.item === ingItem;
+    });
     if (m) return m;
-    // Strip parentheticals, a leading quantity/unit, and anything after a
-    // comma/dash qualifier — leaving the core item name.
-    const base = normalize(
-      String(ingName)
-        .replace(/\([^)]*\)/g, " ")     // remove (9.2 oz), (3 cups), etc.
-        .replace(/^\s*[\d.\/]+\s*(?:g|kg|oz|lb|lbs?|ml|l|cups?|tbsp|tsp|cloves?|stalks?|slices?|pieces?|pcs?|cans?|bunch(?:es)?|heads?)?\s+/i, "") // strip leading "260 g", "2 cloves", "12"
-        .split(/[,–—-]/)[0]             // take part before a comma/dash qualifier
-        .trim()
-    );
-    if (base && base !== ni) {
-      m = pantry.find(p => normalize(p.name) === base);
-      if (m) return m;
-    }
-    // Substring match both directions, on the base name (longest pantry match wins
-    // so "brown sugar" beats "sugar" when both are present).
-    const key = base || ni;
+    // 3. Exact normalized-name fallback.
+    m = pantry.find(p => normalize(p.name) === ni);
+    if (m) return m;
+    // 4. Substring match (longest pantry name wins so "brown sugar" beats "sugar").
+    const key = ingItem || ni;
     if (key) {
       const subs = pantry.filter(p => {
-        const np = normalize(p.name);
+        const np = normalizeIngredient(p)?.item || normalize(p.name);
         return np === key || np.includes(key) || key.includes(np);
       });
       if (subs.length) {
-        subs.sort((a, b) => normalize(b.name).length - normalize(a.name).length);
+        subs.sort((a, b) => (normalizeIngredient(b)?.item || "").length - (normalizeIngredient(a)?.item || "").length);
         return subs[0];
       }
     }
@@ -1969,35 +2328,31 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
   function buildCookLines(recipe) {
     const factor = scaleFor(recipe);
     const tracked = [], spices = [], untracked = [];
-    for (const ing of (recipe.ingredients || [])) {
-      const cat = guessCategory(ing.name);
-      if (cat === "Spices") { spices.push(ing.name); continue; }
+    for (const rawIng of (recipe.ingredients || [])) {
+      const ing = normalizeIngredient(rawIng);
+      if (!ing) continue;                       // header / empty
+      if (ing.neverBuy) continue;               // water etc.
+      if (ing.category === "Spices") { spices.push(ing.itemDisplay); continue; }
       const need = (ing.qty || 1) * factor;
-      const pItem = findPantryMatch(ing.name);
+      const pItem = findPantryMatch(rawIng.name || ing.item);
       if (pItem) {
-        const info = unitInfo(ing.unit), pInfo = unitInfo(pItem.unit);
-        // Two count families unify even when one is generic "count" and the
-        // other an isolated "count:x" — fall back to treating both as singles.
-        const bothCountish = info.family.startsWith("count") && pInfo.family.startsWith("count");
-        const sameFamily = info.family === pInfo.family;
+        const pn = normalizeIngredient(pItem);
+        const bothCountish = ing.family.startsWith("count") && pn.family.startsWith("count");
+        const sameFamily = ing.family === pn.family;
         if (sameFamily || bothCountish) {
-          // Convert the needed amount to base units using the recipe unit's
-          // factor, then express the deduction in the PANTRY unit via its factor.
-          // Works uniformly for mass (g), volume (ml), and count (singles):
-          // "4 eggs" = 4 base; pantry "2 dozen" = 24 base; deduct 4 -> 20 base
-          // = 1.67 dozen.
-          const rFactor = sameFamily ? info.factor : 1;   // if not same family, both are singles
-          const pFactor = sameFamily ? pInfo.factor : (PLAIN_COUNT_LABELS.has((pItem.unit||"").toLowerCase().trim()) ? 1 : pInfo.factor);
+          // Deduct using base units. Recipe need -> base, expressed in pantry unit.
+          const rFactor = sameFamily ? nUnitInfo(ing.unit).factor : 1;
+          const pFactor = sameFamily ? nUnitInfo(pItem.unit).factor : (PLAIN_COUNT_LABELS.has((pItem.unit||"").toLowerCase().trim()) ? 1 : nUnitInfo(pItem.unit).factor);
           const needBase = need * rFactor;
           const haveBase = pItem.qty * pFactor;
           const deduct = round1(needBase / pFactor);
           const after = round1(Math.max(0, haveBase - needBase) / pFactor);
-          tracked.push({ id: pItem.id, name: ing.name, unit: pItem.unit, deduct, have: pItem.qty, after });
+          tracked.push({ id: pItem.id, name: ing.itemDisplay, unit: pItem.unit, deduct, have: pItem.qty, after });
         } else {
-          untracked.push({ name: ing.name, reason: "unit mismatch", qty: need, unit: ing.unit });
+          untracked.push({ name: ing.itemDisplay, reason: "unit mismatch", qty: need, unit: ing.unit });
         }
       } else {
-        untracked.push({ name: ing.name, reason: "not in pantry", qty: need, unit: ing.unit });
+        untracked.push({ name: ing.itemDisplay, reason: "not in pantry", qty: need, unit: ing.unit });
       }
     }
     return { factor, tracked, spices, untracked };
@@ -2140,6 +2495,29 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
       return next;
     });
     setSelectedSlot(null);
+  }
+
+  // Clear the whole week so the user can plan fresh. Locked slots are kept
+  // (a user locks meals they want to protect); everything else is emptied.
+  function clearWeek() {
+    const anyContent = DAYS.some(d => MEALS.some(m => slotEntries(plan?.[d]?.[m]).length > 0));
+    if (!anyContent) return;
+    const lockedCount = DAYS.reduce((a, d) => a + MEALS.filter(m => plan?.[d]?.[m]?.locked && slotEntries(plan[d][m]).length > 0).length, 0);
+    const message = lockedCount > 0
+      ? `${lockedCount} locked meal${lockedCount > 1 ? "s" : ""} will be kept; everything else is emptied so you can plan a fresh week.`
+      : "This empties every slot so you can plan a fresh week.";
+    showConfirm({ title: "Clear the meal plan?", message, confirmText: "Clear", danger: true }).then(ok => {
+      if (!ok) return;
+      setPlan(prev => {
+        const next = JSON.parse(JSON.stringify(prev));
+        for (const d of DAYS) for (const m of MEALS) {
+          if (next[d]?.[m]?.locked && slotEntries(next[d][m]).length > 0) continue; // keep locked
+          if (next[d]) next[d][m] = null;
+        }
+        return next;
+      });
+      setSelectedSlot(null);
+    });
   }
 
   function doGenerate() {
@@ -2340,6 +2718,9 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
         <span style={{ fontSize:14, fontWeight:700 }}>Meal Plan</span>
         {recipes.length > 0 && (
           <div style={{ display:"flex", gap:6 }}>
+            {DAYS.some(d => MEALS.some(m => slotEntries(plan?.[d]?.[m]).length > 0)) && (
+              <Btn small variant="ghost" style={{ color:COLORS.red, borderColor:COLORS.red }} onClick={clearWeek}>Clear</Btn>
+            )}
             <Btn small variant="secondary" onClick={doRerollUnlocked}>🎲 Reroll</Btn>
             <Btn small onClick={doGenerate}>Generate</Btn>
           </div>
@@ -2856,9 +3237,9 @@ function ShopTab({ plan, recipes, setRecipes, pantry, setPantry, spices, setSpic
     const unified = buildUnifiedList(plan, recipes, pantry, excludes, activeIds, maxOmissions);
     // Merge manual items in, deduped by name+family against the unified list.
     const byKey = {};
-    const keyOf = (name, unit) => `${normalize(name)}|${unitInfo(unit).family}`;
+    const keyOf = (it) => `${it.item || normalize(it.name)}|${nUnitInfo(it.unit).family}`;
     [...unified, ...manual].forEach(it => {
-      const k = keyOf(it.name, it.unit);
+      const k = keyOf(it);
       if (!byKey[k]) byKey[k] = { ...it };
       else {
         // keep existing; note manual source if applicable
@@ -3059,10 +3440,11 @@ function ShopTab({ plan, recipes, setRecipes, pantry, setPantry, spices, setSpic
                       </div>
                       <div style={{ flex:1, minWidth:0 }}>
                         <span style={{ fontSize:14, color:(item.checked&&!mergeMode)?COLORS.textSec:COLORS.text, textDecoration:(item.checked&&!mergeMode)?"line-through":"none" }}>{item.name}</span>
+                        {item.formNote && !mergeMode && <span style={{ fontSize:11, color:COLORS.textSec, fontStyle:"italic" }}> · {item.formNote}</span>}
                         {item.reason && !mergeMode && <div style={{ fontSize:9, color:COLORS.red }}>{item.reason}</div>}
                       </div>
                       <div style={{ textAlign:"right", flexShrink:0 }}>
-                        <div style={{ fontSize:12, color:COLORS.textSec }}>{item.unit ? `${item.qty} ${item.unit}` : `×${item.qty}`}</div>
+                        <div style={{ fontSize:12, color:COLORS.textSec }}>{(item.qty == null || item.qty === "") ? (item.unit || "") : item.unit ? `${item.qty} ${item.unit}` : `×${item.qty}`}</div>
                         {groupBy==="category" && item.store && !mergeMode && <div style={{ fontSize:9, color:COLORS.textSec }}>{item.store}</div>}
                       </div>
                     </div>
@@ -3181,7 +3563,20 @@ function PantryTab({ pantry, setPantry, spices, setSpices }) {
   function deleteItem(id) { setPantry(prev => prev.filter(p => p.id !== id)); setEditId(null); }
   function addItem() {
     if (!addForm.name.trim()) return;
-    setPantry(prev => [...prev, { ...addForm, id: uid(), name: normalize(addForm.name) }]);
+    // Stage 2c: run the manual entry through the normalizer so pantry items carry
+    // the same schema as recipe ingredients (canonical item, clean unit, family,
+    // category). The user's qty/floor/storage/stores are preserved as-is.
+    const norm = normalizeIngredient({ name: addForm.name, unit: addForm.unit, qty: addForm.qty });
+    const cleaned = norm ? {
+      ...addForm,
+      name: norm.item,               // canonical identity (so it matches recipes)
+      itemDisplay: norm.itemDisplay, // nicer label for display
+      unit: addForm.unit || norm.unit, // the form's explicit unit wins
+      family: norm.family,
+      category: norm.category,
+      soldAs: norm.soldAs,
+    } : { ...addForm, name: normalize(addForm.name) };
+    setPantry(prev => [...prev, { ...cleaned, id: uid() }]);
     setAddForm({ name:"", qty:1, unit:"pcs", floor:0, storage:"dry", stores:[] });
     setShowAdd(false);
   }
@@ -3259,7 +3654,7 @@ function PantryTab({ pantry, setPantry, spices, setSpices }) {
               <div onClick={() => setEditId(isEdit?null:item.id)} style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 12px", borderRadius:isEdit?"8px 8px 0 0":8, background:below?COLORS.quarantineBg:COLORS.surface, border:`1px solid ${below?`${COLORS.quarantine}30`:COLORS.border}`, borderBottom:isEdit?"none":undefined, cursor:"pointer" }}>
                 <div style={{ width:4, height:32, borderRadius:2, background:sc.fg, flexShrink:0 }} />
                 <div style={{ flex:1, minWidth:0 }}>
-                  <div style={{ fontSize:14, fontWeight:600 }}>{item.name}</div>
+                  <div style={{ fontSize:14, fontWeight:600 }}>{item.itemDisplay || item.name}</div>
                   <div style={{ display:"flex", gap:6, alignItems:"center", marginTop:2 }}>
                     <Badge color={sc.fg} bg={sc.bg}>{sc.label}</Badge>
                     {itemStores(item).length > 0 && <span style={{ fontSize:10, color:COLORS.textSec }}>{itemStores(item).join(", ")}</span>}
@@ -3274,13 +3669,29 @@ function PantryTab({ pantry, setPantry, spices, setSpices }) {
               </div>
               {isEdit && (
                 <div style={{ padding:"10px 12px", background:below?COLORS.quarantineBg:COLORS.surface, border:`1px solid ${below?`${COLORS.quarantine}30`:COLORS.border}`, borderTop:`1px dashed ${COLORS.border}`, borderRadius:"0 0 8px 8px", display:"flex", gap:10, alignItems:"flex-end", flexWrap:"wrap" }} onClick={e => e.stopPropagation()}>
+                  <div style={{ flexBasis:"100%" }}>
+                    <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:2 }}>Name</div>
+                    <input value={item.itemDisplay ?? item.name ?? ""} onChange={e => updateItem(item.id, { itemDisplay: e.target.value, name: normalize(e.target.value) })} style={{ width:"100%", boxSizing:"border-box", padding:"6px 8px", borderRadius:5, border:`1.5px solid ${COLORS.border}`, fontSize:14 }} />
+                  </div>
                   <div>
                     <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:2 }}>Qty</div>
                     <NumberInput value={item.qty} onCommit={v => updateItem(item.id, { qty: v })} min={0} fallback={0} style={{ width:56, padding:"5px 6px", borderRadius:5, border:`1.5px solid ${COLORS.border}`, fontSize:14, textAlign:"center", fontWeight:600 }} />
                   </div>
+                  <div style={{ minWidth:96 }}>
+                    <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:2 }}>Unit</div>
+                    <PickList value={item.unit || ""} onChange={v => updateItem(item.id, { unit: v })} options={UNIT_PICK_OPTIONS} />
+                  </div>
                   <div>
                     <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:2 }}>Floor</div>
                     <NumberInput value={item.floor} onCommit={v => updateItem(item.id, { floor: v })} min={0} fallback={0} style={{ width:56, padding:"5px 6px", borderRadius:5, border:`1.5px solid ${below?COLORS.quarantine:COLORS.border}`, fontSize:14, textAlign:"center", fontWeight:600 }} />
+                  </div>
+                  <div>
+                    <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:2 }}>Storage</div>
+                    <div style={{ display:"flex", gap:4 }}>
+                      {Object.entries(SC).map(([k, scOpt]) => (
+                        <Btn key={k} small variant={item.storage===k?"primary":"ghost"} onClick={() => updateItem(item.id, { storage: k })} style={item.storage===k?{ background:scOpt.fg, fontSize:11, padding:"4px 8px" }:{ fontSize:11, padding:"4px 8px", color:scOpt.fg, borderColor:scOpt.fg }}>{scOpt.label}</Btn>
+                      ))}
+                    </div>
                   </div>
                   <div style={{ minWidth:140 }}>
                     <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:2 }}>Store(s)</div>
@@ -3432,18 +3843,20 @@ function PeopleSection({ people, setPeople }) {
                   <div onClick={() => updatePerson(p.id, { active: !p.active })} style={{ width:22, height:22, borderRadius:5, border:`2px solid ${p.active?COLORS.primary:COLORS.border}`, background:p.active?COLORS.primary:"transparent", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", flexShrink:0 }}>
                     {p.active && <span style={{ color:"#fff", fontSize:13, fontWeight:700 }}>✓</span>}
                   </div>
-                  <span style={{ fontSize:14, fontWeight:700, flex:1 }}>{p.name}</span>
+                  <span style={{ fontSize:14, fontWeight:700, flex:1 }}>{p.itemDisplay || p.name}</span>
                   <span style={{ fontSize:11, color:COLORS.textSec }}>{(p.weight * p.attendance).toFixed(2)} portion</span>
                   <span style={{ fontSize:14, cursor:"pointer", color:COLORS.red }} onClick={() => removePerson(p.id)}>×</span>
                 </div>
                 <div style={{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center" }}>
-                  <select value={p.profile} onChange={e => { const npt = PROFILE_TYPES.find(x => x.key === e.target.value); updatePerson(p.id, { profile: npt.key, weight: npt.weight }); }} style={{ fontSize:12, padding:"4px 6px", borderRadius:5, border:`1px solid ${COLORS.border}`, background:"#fff" }}>
-                    {PROFILE_TYPES.map(t => <option key={t.key} value={t.key}>{t.label}</option>)}
-                  </select>
+                  <div style={{ minWidth:90 }}>
+                    <PickList value={p.profile} onChange={v => { const npt = PROFILE_TYPES.find(x => x.key === v); updatePerson(p.id, { profile: npt.key, weight: npt.weight }); }}
+                      options={PROFILE_TYPES.map(t => ({ value: t.key, label: t.label }))} />
+                  </div>
                   <NumberInput value={p.weight} onCommit={v => updatePerson(p.id, { weight: v })} min={0} step="0.05" fallback={0} style={{ width:54, fontSize:12, padding:"4px 6px", borderRadius:5, border:`1px solid ${COLORS.border}`, textAlign:"center" }} title="portion weight" />
-                  <select value={att.key} onChange={e => { const na = ATTENDANCE.find(x => x.key === e.target.value); updatePerson(p.id, { attendance: na.factor }); }} style={{ fontSize:12, padding:"4px 6px", borderRadius:5, border:`1px solid ${COLORS.border}`, background:"#fff" }}>
-                    {ATTENDANCE.map(a => <option key={a.key} value={a.key}>{a.label}</option>)}
-                  </select>
+                  <div style={{ minWidth:110 }}>
+                    <PickList value={att.key} onChange={v => { const na = ATTENDANCE.find(x => x.key === v); updatePerson(p.id, { attendance: na.factor }); }}
+                      options={ATTENDANCE.map(a => ({ value: a.key, label: a.label }))} />
+                  </div>
                 </div>
               </Card>
             );
@@ -3456,11 +3869,11 @@ function PeopleSection({ people, setPeople }) {
         <span style={{ fontSize:16, fontWeight:800, color:COLORS.boost }}>{demand > 0 ? demand.toFixed(2) : "—"}</span>
       </div>
 
-      <div style={{ display:"flex", gap:6 }}>
+      <div style={{ display:"flex", gap:6, alignItems:"center" }}>
         <input value={name} onChange={e => setName(e.target.value)} placeholder="Name..." style={{ flex:1, padding:"8px 10px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, fontSize:13 }} />
-        <select value={profile} onChange={e => setProfile(e.target.value)} style={{ fontSize:13, padding:"4px 8px", borderRadius:6, border:`1.5px solid ${COLORS.border}`, background:"#fff" }}>
-          {PROFILE_TYPES.map(t => <option key={t.key} value={t.key}>{t.label}</option>)}
-        </select>
+        <div style={{ minWidth:96 }}>
+          <PickList value={profile} onChange={setProfile} options={PROFILE_TYPES.map(t => ({ value: t.key, label: t.label }))} />
+        </div>
         <Btn small onClick={addPerson}>Add</Btn>
       </div>
     </div>
@@ -3756,10 +4169,10 @@ function ExcludesSection({ excludes, onChange, people, ingredientPool = [] }) {
         )}
         <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
           <span style={{ fontSize:11, color:COLORS.textSec, fontWeight:600 }}>For:</span>
-          <select value={newScope} onChange={e => setNewScope(e.target.value)} style={{ fontSize:12, padding:"5px 8px", borderRadius:5, border:`1px solid ${COLORS.border}`, background:"#fff" }}>
-            <option value="all">Everyone</option>
-            {people.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-          </select>
+          <div style={{ minWidth:110 }}>
+            <PickList value={newScope} onChange={setNewScope}
+              options={[{ value:"all", label:"Everyone" }, ...people.map(p => ({ value: p.id, label: p.name }))]} />
+          </div>
           <label style={{ display:"flex", alignItems:"center", gap:4, fontSize:12, cursor:"pointer" }}>
             <input type="checkbox" checked={permanent} onChange={e => setPermanent(e.target.checked)} /> Permanent
           </label>
@@ -3800,6 +4213,7 @@ function BoostsSection({ boosts, onChange, ingredientPool = [] }) {
 }
 
 function DataSection() {
+  const importRef = useRef(null);
   function exportAll() {
     const data = {};
     for (let i = 0; i < localStorage.length; i++) {
@@ -3809,8 +4223,34 @@ function DataSection() {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "prep-backup.json"; a.click();
   }
+  function importBackup(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      let data;
+      try { data = JSON.parse(e.target.result); }
+      catch (err) { showAlert({ title: "Import failed", message: "That file isn't valid JSON.\n\n(" + err.message + ")" }); return; }
+      if (!data || typeof data !== "object") { showAlert({ title: "Import failed", message: "The file didn't contain a backup object." }); return; }
+      const keys = Object.keys(data).filter(k => k.startsWith("prep_"));
+      if (keys.length === 0) { showAlert({ title: "Import failed", message: "No Prep data found in that file (expected keys like prep_recipes)." }); return; }
+      const recipeCount = Array.isArray(data.prep_recipes) ? data.prep_recipes.length : 0;
+      const found = `Found ${keys.length} data section${keys.length > 1 ? "s" : ""}` + (recipeCount ? `, ${recipeCount} recipes` : "") + ".";
+      showConfirm({ title: "Import this backup?", message: `${found}\n\nThis REPLACES your current data in this app. Export your own backup first if you want to keep it.`, confirmText: "Import", danger: true }).then(ok => {
+        if (!ok) return;
+        try {
+          keys.forEach(k => localStorage.setItem(k, JSON.stringify(data[k])));
+          showAlert({ title: "Imported", message: "Imported successfully. Reloading now." }).then(() => window.location.reload());
+        } catch (err) {
+          showAlert({ title: "Partial import", message: "Import wrote partially but hit an error (storage may be full):\n\n" + err.message });
+        }
+      });
+    };
+    reader.onerror = () => showAlert({ title: "Import failed", message: "Couldn't read the file." });
+    reader.readAsText(file);
+  }
   function clearAll() {
-    if (confirm("Delete ALL data? This cannot be undone.")) {
+    showConfirm({ title: "Delete ALL data?", message: "This permanently deletes every recipe, pantry item, plan, and setting in this app. This cannot be undone.", confirmText: "Delete everything", danger: true }).then(ok => {
+      if (!ok) return;
       const keys = [];
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
@@ -3818,13 +4258,16 @@ function DataSection() {
       }
       keys.forEach(k => localStorage.removeItem(k));
       window.location.reload();
-    }
+    });
   }
   return (
     <div>
       <div style={{ fontSize:12, color:COLORS.textSec, marginBottom:10 }}>Manage your data</div>
       <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
         <Btn variant="secondary" onClick={exportAll}>Export backup (JSON)</Btn>
+        <Btn variant="secondary" onClick={() => importRef.current && importRef.current.click()}>Import backup (JSON)</Btn>
+        <input ref={importRef} type="file" accept="application/json,.json" style={{ display:"none" }}
+               onChange={(e) => { importBackup(e.target.files && e.target.files[0]); e.target.value = ""; }} />
         <Btn variant="danger" onClick={clearAll}>Clear all data</Btn>
       </div>
     </div>
@@ -3859,29 +4302,22 @@ function cleanRecipes(arr) {
     if (!r || !Array.isArray(r.ingredients)) return r;
     let changed = false;
     const ingredients = r.ingredients.map(ing => {
-      if (!ing || typeof ing.name !== "string") return ing;
-      const stripped = stripArtifacts(ing.name);
-      // Re-parse when the name still carries a leading quantity, a leading unit
-      // word ("teaspoon cumin"), or qty was never captured — i.e. a compound
-      // string from an old paste. Re-parsing splits qty/unit/name properly and
-      // strips prep clauses. Don't touch entries that already look clean.
-      const looksCompound =
-        ((ing.qty == null || ing.qty === 1) && !ing.unit && (startsWithQty(stripped) || startsWithUnitWord(stripped)));
-      if (looksCompound) {
-        const parsed = parseIngredientLine(stripped);
-        if (parsed && (parsed.qty !== 1 || parsed.unit || parsed.name !== normalize(stripped))) {
-          changed = true;
-          return { ...ing, qty: parsed.qty, unit: parsed.unit, name: parsed.name };
-        }
-      }
-      const cleaned = normalize(stripped);
-      if (cleaned !== ing.name) { changed = true; return { ...ing, name: cleaned }; }
-      return ing;
-    }).filter(ing => {
-      // Drop stored ingredients that are really section headers.
-      if (ing && typeof ing.name === "string" && isSectionHeader(ing.name)) { changed = true; return false; }
-      return true;
-    });
+      if (!ing) return ing;
+      // If the ingredient is already a clean schema object (has item + a real
+      // name), leave it. Otherwise re-normalize it through the schema — this
+      // repairs undefined/missing names AND upgrades legacy {qty,unit,name}
+      // entries to the full schema (carrying confirmed:false so they show the
+      // subtle review dot). Section headers normalize to null and get dropped.
+      const hasCleanSchema = ing.item && typeof ing.name === "string" && ing.name.length > 0 && ing.name !== "undefined" && ing.name !== "null";
+      if (hasCleanSchema) return ing;
+      // Garbage from the earlier ingsToText bug ("2 undefined") — drop it.
+      if (ing.name === "undefined" || ing.name === "null" || ing.item === "undefined") { changed = true; return null; }
+      const upgraded = normalizeIngredient(ing.name != null ? ing : { ...ing, name: ing.item || ing.itemDisplay || "" }, { tier: ing.tier });
+      if (!upgraded) { changed = true; return null; } // header/empty -> drop
+      changed = true;
+      // Preserve the user's confirmed flag if they'd already reviewed it.
+      return { ...upgraded, confirmed: ing.confirmed === true ? true : false };
+    }).filter(Boolean);
     return changed ? { ...r, ingredients } : r;
   });
 }
@@ -4049,6 +4485,7 @@ export default function App() {
           onClose={() => { setSeenSurvey(true); save("seenSurvey", true); }}
         />
       )}
+      <DialogHost />
     </div>
   );
 }

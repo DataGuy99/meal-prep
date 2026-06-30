@@ -51,6 +51,9 @@ function evalQtyToken(tok) {
 }
 function parseLeadingQty(s) {
   let str = String(s).trim();
+  // Strip comma thousands separators inside numbers ("1,600 g" -> "1600 g")
+  // so large weights parse correctly instead of losing the quantity.
+  str = str.replace(/(\d),(?=\d{3}\b)/g, "$1");
   let expanded = "";
   for (const ch of str) expanded += (FRACTION_MAP[ch] != null ? " " + FRACTION_MAP[ch] : ch);
   expanded = expanded.trim();
@@ -77,17 +80,35 @@ const UNIT_WORD_MAP = {
   clove: "clove", cloves: "clove", stalk: "stalk", stalks: "stalk",
   slice: "slice", slices: "slice", piece: "pc", pieces: "pc", pc: "pc", pcs: "pc",
   bunch: "bunch", bunches: "bunch", block: "block", blocks: "block",
-  fillet: "fillet", fillets: "fillet", dozen: "dozen", pinch: "pinch", dash: "dash",
+  fillet: "fillet", fillets: "fillet", dozen: "dozen", doz: "dozen", dz: "dozen", pinch: "pinch", dash: "dash",
+  jar: "jar", jars: "jar", package: "package", packages: "package", pack: "pack", packs: "pack",
+  container: "container", containers: "container", box: "box", boxes: "box",
+  sprig: "sprig", sprigs: "sprig", handful: "handful", stick: "stick", sticks: "stick",
 };
 const UNIT_WORD_ALTERNATION = Object.keys(UNIT_WORD_MAP).sort((a, b) => b.length - a.length).join("|");
 
 // ---- text helpers ----
-const NORM_KEEP = new Set(["hummus", "couscous", "asparagus", "molasses", "watercress"]);
+const NORM_KEEP = new Set(["hummus", "couscous", "asparagus", "molasses", "watercress", "chili", "chilli", "broccoli", "zucchini", "spaghetti", "macaroni", "gnocchi", "confetti", "ravioli"]);
+// Words where -ies -> -y is WRONG (the singular already ends in -i, plural is just -es/-s).
+const IES_EXCEPTIONS = { chilies: "chili", chillies: "chilli", chilis: "chili" };
 export function normalize(s) {
   if (typeof s !== "string") s = s == null ? "" : String(s);
   let w = s.toLowerCase().trim().replace(/-/g, " ").replace(/\s+/g, " ");
   if (!w) return w;
+  // Multi-word: only singularize the LAST word (the head noun). This keeps
+  // compounds intact ("green onion" stays, "fish cake" stays) while still
+  // fixing "green chilies" -> "green chili".
+  if (w.includes(" ")) {
+    const parts = w.split(" ");
+    const last = parts.pop();
+    return [...parts, singularize(last)].join(" ");
+  }
+  return singularize(w);
+}
+function singularize(w) {
+  if (!w) return w;
   if (NORM_KEEP.has(w)) return w;
+  if (IES_EXCEPTIONS[w]) return IES_EXCEPTIONS[w];
   if (/[^aeiou]ies$/.test(w)) return w.replace(/ies$/, "y");
   if (/ves$/.test(w)) return w.replace(/s$/, "");
   if (/oes$/.test(w)) return w.replace(/es$/, "");
@@ -110,7 +131,9 @@ const CANONICAL_BASE = [
   [/^(fine|coarse|kosher|sea|table|flaky|iodized)?\s*salt$/, "salt"],
   [/^garlic clove(s)?$/, "garlic"],
   [/^clove(s)? garlic$/, "garlic"],
-  [/^(minced|crushed|grated)?\s*garlic$/, "garlic"],
+  [/\bgarlic clove(s)?\b/, "garlic"],
+  [/\bclove(s)? (of )?garlic\b/, "garlic"],
+  [/^(minced|crushed|grated|chopped|sliced|whole|peeled)?\s*garlic( clove(s)?)?( minced| crushed| grated| chopped)?$/, "garlic"],
   [/^(yellow|white|red|brown|spanish|sweet)?\s*onion$/, "onion"],
   [/^(freshly ground|ground|cracked|whole)?\s*black pepper$/, "black pepper"],
   [/^(all purpose|plain|cake|bread|self raising|self-raising)?\s*flour$/, "flour"],
@@ -120,11 +143,27 @@ const CANONICAL_BASE = [
   [/^(spring onion|scallion|green onion)s?$/, "green onion"],
   [/^(low fat|reduced fat|full fat|light|homemade|japanese|kewpie)?\s*mayonnaise$/, "mayonnaise"],
   [/^(low fat|reduced fat|full fat|light|homemade)?\s*mayo$/, "mayonnaise"],
+  // Stocks/broths are their own products (you buy a carton, not the meat).
+  // These MUST come before the beef/chicken meat rules below so "beef stock"
+  // and "chicken broth" don't collapse into "beef"/"chicken breast".
+  [/.*\b(beef|chicken|vegetable|veg|pork|fish|bone|dashi)\b.*\b(stock|broth)\b.*/, (mm) => {
+    const base = /beef/.test(mm) ? "beef" : /chicken/.test(mm) ? "chicken" : /pork/.test(mm) ? "pork" : /fish/.test(mm) ? "fish" : /dashi/.test(mm) ? "dashi" : "vegetable";
+    return base + " stock";
+  }],
+  [/.*\b(stock|broth)\b.*/, "stock"],
   [/.*\bchicken breast\b.*/, "chicken breast"],
   [/.*\bchicken thigh\b.*/, "chicken thigh"],
   [/^.*boneless skinless chicken.*$/, "chicken breast"],
-  [/.*\b(rib eye|ribeye|top sirloin|sirloin)\b.*/, "beef"],
+  [/.*\b(rib eye|ribeye|top sirloin|sirloin|flank steak|skirt steak|chuck|brisket)\b.*/, "beef"],
+  [/.*\b(thinly sliced beef|thin beef|thinly beef|lean beef|ground beef|beef short rib|short rib|stewing beef|beef chuck)\b.*/, "beef"],
+  [/^beef\b.*/, "beef"],
   [/.*\bfish cake\b.*/, "fish cake"],
+  [/^(neutral |cooking |vegetable |canola |neutral cooking )?oil\b.*/, "oil"],
+  [/.*\bcooking oil\b.*/, "oil"],
+  [/^soy$/, "soy sauce"],
+  [/.*\bkikkoman.*soy.*/, "soy sauce"],
+  [/.*soup soy sauce.*/, "soy sauce"],
+  [/^(white |granulated |caster )?sugar\b.*/, "sugar"],
 ];
 
 const SECTION_HEADERS = new Set(["for the sauce","for the meat","for the marinade","for the dough","for the filling","for the topping","for the garnish","for the batter","for the dressing","for the soup","for the base","for the broth","for the seasoning","for serving","for the dipping sauce","for the glaze","sauce","marinade","seasoning","garnish","topping","filling","dressing","dipping sauce","soy dipping sauce","for the coating","to serve","optional","for the rice","for the noodles","for the vegetables","for the chicken","for sauce","for meat","for marinade","second marination","first marination","marination","bulgogi marinade"]);
@@ -156,6 +195,13 @@ export function canonicalize(rawName) {
   for (const noise of MERGE_NOISE) n = n.replace(new RegExp(`(^|[,\\s])${noise.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([,\\s]|$)`, "gi"), " ");
   n = n.replace(/[,]+/g, " ").replace(/\s+/g, " ").trim();
   n = n.split(" ").map(w => normalize(w)).filter(Boolean).join(" ");
+  // If stripping left nothing usable (e.g. name was just "cloves (optional)" and
+  // both the noun and the parenthetical got removed), fall back to the cleaned
+  // pre-canonical display rather than emitting leftover junk like "(optional)".
+  if (!n || /^\(?optional\)?$/.test(n) || /^[^a-z]*$/.test(n)) {
+    const fallback = display0.replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").trim();
+    n = fallback || display0;
+  }
   let item = n || display0;
   for (const [re, to] of CANONICAL_BASE) { if (re.test(item)) { item = item.replace(re, to).replace(/\s+/g, " ").trim(); break; } }
   // Display label: the cleaned-but-uncanonicalized name (nicer), falling back to item.
@@ -173,16 +219,31 @@ export function isNeverBuy(name) {
 // opts:  { tier } default "essential"
 // returns: structured Ingredient, or null (header/empty/never-buy)
 export function normalizeIngredient(input, opts = {}) {
-  const tier = opts.tier || (input && input.tier) || "essential";
+  let tier = opts.tier || (input && input.tier) || "essential";
+  // An "(optional)" / "optional" marker anywhere means this is a secondary
+  // ingredient — and the word must never become part of the item name.
+  if (/\boptional\b/i.test(typeof input === "string" ? input : (input && input.name) || "")) {
+    tier = "secondary";
+  }
 
   // Reconstruct a single raw line from either form.
   let rawLine;
   if (typeof input === "string") {
     rawLine = input;
   } else if (input && typeof input === "object") {
-    const q = input.qty != null && (input.qty !== 1 || input.unit) ? input.qty + " " : "";
-    const u = input.unit ? input.unit + " " : "";
-    rawLine = `${q}${u}${input.name || ""}`.trim();
+    const nameStr = (input.name || "").trim();
+    // If the NAME itself begins with a quantity (and optionally a unit), the
+    // stored qty/unit is usually a mangled import artifact (e.g. stored qty 1.2
+    // but name "1.4 kg beef short ribs"). Trust the name — prepending the stored
+    // qty would create a double quantity ("1.2 1.4 kg ..."). Otherwise combine.
+    const nameHasLeadingQty = /^\s*[\d.,/½⅓⅔¼¾⅛]+\s*(?:g|kg|oz|lb|lbs?|ml|l|cups?|tbsp|tsp|cloves?|pieces?|cans?|x\b)?\s+\D/i.test(nameStr);
+    if (nameHasLeadingQty) {
+      rawLine = nameStr;
+    } else {
+      const q = input.qty != null && (input.qty !== 1 || input.unit) ? input.qty + " " : "";
+      const u = input.unit ? input.unit + " " : "";
+      rawLine = `${q}${u}${nameStr}`.trim();
+    }
   } else {
     return null;
   }
@@ -193,6 +254,8 @@ export function normalizeIngredient(input, opts = {}) {
 
   // Strip a broken-range remnant ("to 4 clove" -> "4 clove").
   let line = raw.replace(/^to\s+(?=[\d½⅓⅔¼¾⅛])/i, "");
+  // Remove optional/required markers — they describe the ingredient, they aren't it.
+  line = line.replace(/\(\s*optional[^)]*\)/gi, " ").replace(/\boptional\b/gi, " ").replace(/\s+/g, " ").trim();
 
   // Quantity.
   let qty = 1, rest = line;
@@ -204,6 +267,24 @@ export function normalizeIngredient(input, opts = {}) {
   const uw = rest.match(new RegExp(`^(${UNIT_WORD_ALTERNATION})\\b\\.?\\s+(.*)$`, "i"));
   if (uw) { unit = UNIT_WORD_MAP[uw[1].toLowerCase()] || ""; rest = uw[2]; }
   rest = rest.replace(/^of\s+/i, "");
+  // Strip leading measurement/size descriptors that aren't the item:
+  // "2 inch cinnamon piece" -> "cinnamon piece", "whole cashew" -> "cashew".
+  rest = rest.replace(/^\s*[\d.\/]*\s*(inch|inches|cm|mm)\s+/i, "");
+  rest = rest.replace(/^(whole|large|medium|small|extra large|fresh|dried|raw|ripe)\s+/i, "");
+  // Strip trailing purpose clauses: "water to blend" -> "water", "oil for frying" -> "oil".
+  rest = rest.replace(/\s+(to blend|to taste|to serve|to garnish|for blending|for frying|for serving|for garnish|for drizzling|for brushing|if required|as needed|or more)\b.*$/i, "");
+
+  // Trailing "<number> <unit>" with no leading quantity: "water 5 cup",
+  // "soy sauce 2 tbsp". The amount was written after the item. Only fires when
+  // we didn't already find a leading qty/unit, so it can't override an explicit
+  // leading amount.
+  if (qty === 1 && !unit) {
+    const trail = rest.match(new RegExp(`^(.+?)\\s+([\\d.\\/]+)\\s*(${UNIT_WORD_ALTERNATION})\\s*$`, "i"));
+    if (trail) {
+      const tq = evalQtyToken(trail[2]);
+      if (tq != null) { rest = trail[1]; qty = tq; unit = UNIT_WORD_MAP[trail[3].toLowerCase()] || ""; }
+    }
+  }
 
   // Name -> canonical identity + display.
   const cleanedName = stripPrepClauseLocal(normalize(rest));
@@ -223,6 +304,40 @@ export function normalizeIngredient(input, opts = {}) {
   const category = db ? db.cat : guessCategoryLocal(item);
   const ambiguousUnit = AMBIGUOUS_UNITS.has((unit || "").toLowerCase());
 
+  // Sub-unit precision: if the item has known sub-units (garlic clove/head) and
+  // the ingredient names one — either as the unit OR in the original name (e.g.
+  // "garlic clove" with no explicit unit) — record its gram weight so the
+  // count<->weight bridge converts exactly (43 cloves = 215 g, not 43 heads).
+  let subUnit = null, subUnitGrams = null;
+  const sub = SUB_UNIT[item];
+  if (sub) {
+    const u = (unit || "").toLowerCase();
+    if (sub[u]) { subUnit = u; subUnitGrams = sub[u].g; }
+    else if (family === "count") {
+      // Look for a sub-unit word in the raw name (e.g. "...clove...").
+      const lowerRaw = raw.toLowerCase();
+      for (const su of Object.keys(sub)) {
+        if (new RegExp(`\\b${su}s?\\b`).test(lowerRaw)) { subUnit = su; subUnitGrams = sub[su].g; break; }
+      }
+    }
+  }
+
+  // Uncertainty signal for the entry-review UI. Flags ingredients a human
+  // should eyeball — but ONLY genuinely suspect ones. We do NOT flag an item
+  // merely for being absent from ITEM_DB: real cooking uses thousands of
+  // ingredients (water, turmeric, kimchi, quinoa...) and the DB has ~110, so a
+  // not-in-DB flag marks ~40% of entries and buries the real problems. Instead
+  // we look for textual red flags in the cleaned item.
+  let uncertain = false, uncertainReason = "";
+  const itemWords = item ? item.split(/\s+/).length : 0;
+  if (!item || item.length < 2) { uncertain = true; uncertainReason = "couldn't read the item"; }
+  else if (/https?:\/\/|www\.\w|\w+\.(?:com|net|org|io|co)\b/i.test(raw)) { uncertain = true; uncertainReason = "looks like a link, not an ingredient"; }
+  else if (/[*]{2,}|#\d|\bhttp\b/i.test(raw)) { uncertain = true; uncertainReason = "has stray symbols — check it"; }
+  else if (itemWords > 6 || item.length > 45) { uncertain = true; uncertainReason = "unusually long — may be a mis-paste"; }
+  else if (/\b(and|&)\b/i.test(item) && itemWords >= 3 && !/\b(and )?(sour cream|half and half|mac and cheese|fish and chips)\b/i.test(item)) { uncertain = true; uncertainReason = "may be two ingredients — split if so"; }
+  else if (/^(\+|or |of )\b/i.test(item) || /\b(or see|refer|updated|adjust|divided)\b/i.test(item)) { uncertain = true; uncertainReason = "leftover recipe text — check it"; }
+  else if (ambiguousUnit) { uncertain = true; uncertainReason = `"${unit}" size varies — confirm amount`; }
+
   return {
     raw,
     qty: qty || 1,
@@ -230,13 +345,18 @@ export function normalizeIngredient(input, opts = {}) {
     family,
     item,
     itemDisplay,
+    name: item,                  // back-compat alias = canonical item (matching code reads ing.name)
     tier,
     confirmed: false,        // becomes true only via the entry-review step
     baseQty,
     soldAs,
     category,
     ambiguousUnit,           // if true: never auto-merge; offer manual merge
+    subUnit,                 // "clove"/"head" when recognized, else null
+    subUnitGrams,            // grams per sub-unit, for precise bridging
     neverBuy: NEVER_BUY.has(item),  // valid ingredient, but shopping skips it (water)
+    uncertain,               // entry-review should flag this one
+    uncertainReason,
   };
 }
 
