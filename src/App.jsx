@@ -836,6 +836,10 @@ const UNIT_CONV = {
 // at a time. These all map to the count family with factor 1, so they unify with
 // dozen/pair (and with each other: "pcs", "whole", "each" are interchangeable).
 const PLAIN_COUNT_LABELS = new Set(["", "pc", "pcs", "piece", "pieces", "whole", "each", "ct", "count", "unit", "units", "head", "heads", "clove", "cloves", "stalk", "stalks", "slice", "slices", "can", "cans", "bag", "bags", "bottle", "bottles", "bunch", "bunches", "block", "blocks", "fillet", "fillets"]);
+// Container units: counts whose CONTENTS are a weight/volume. Bridging a
+// container to a recipe's volume/mass need requires a per-item size definition
+// (set in pantry edit). Without it we refuse to cross-convert.
+const CONTAINER_UNITS = new Set(["bottle","bottles","can","cans","jar","jars","bag","bags","pack","packs","pac","box","boxes","carton","cartons","tube","tubes","tin","tins","packet","packets"]);
 
 function unitInfo(unit) {
   const u = (unit || "").toLowerCase().trim();
@@ -2337,12 +2341,39 @@ function PlanTab({ recipes, setRecipes, plan, setPlan, settings, pantry, setPant
       const pItem = findPantryMatch(rawIng.name || ing.item);
       if (pItem) {
         const pn = normalizeIngredient(pItem);
-        const bothCountish = ing.family.startsWith("count") && pn.family.startsWith("count");
+        const pUnitRaw = (pItem.unit || "").toLowerCase().trim();
+        const rUnitRaw = (ing.unit || "").toLowerCase().trim();
+        // Is the pantry stored in a CONTAINER unit (bottle/bag/can/jar/pack)?
+        // These are counts whose CONTENTS are a weight/volume — you can't compare
+        // "12 tbsp" to "4 bottles" without knowing what one bottle holds.
+        const isContainer = CONTAINER_UNITS.has(pUnitRaw);
+        const containerSize = pItem.containerSize; // { amount, unit } e.g. {500,"ml"}
         const sameFamily = ing.family === pn.family;
-        if (sameFamily || bothCountish) {
-          // Deduct using base units. Recipe need -> base, expressed in pantry unit.
+        const sameContainerUnit = isContainer && rUnitRaw === pUnitRaw;
+        // "Both countish" is only safe when neither side is a CONTAINER with
+        // contents in a different family. A plain count (egg, carrot) is fine.
+        const bothPlainCount = ing.family === "count" && pn.family === "count" && !isContainer
+          && !ing.unit && PLAIN_COUNT_LABELS.has(pUnitRaw);
+
+        if (isContainer && !sameContainerUnit) {
+          // Container pantry item vs a non-container recipe need. Bridge ONLY if
+          // the user defined the container size AND it shares the recipe's family.
+          const cs = containerSize && containerSize.amount > 0 ? nUnitInfo(containerSize.unit) : null;
+          if (cs && cs.family === ing.family) {
+            // e.g. need 12 tbsp (volume), 1 bottle = 500 ml (volume).
+            const needBase = need * nUnitInfo(ing.unit).factor;     // ml
+            const perContainer = containerSize.amount * cs.factor;  // ml per bottle
+            const deductContainers = round1(needBase / perContainer);
+            const after = round1(Math.max(0, pItem.qty - deductContainers));
+            tracked.push({ id: pItem.id, name: ing.itemDisplay, unit: pItem.unit, deduct: deductContainers, have: pItem.qty, after });
+          } else {
+            // Undefined or incompatible container — DON'T guess (this is the
+            // 430 ml -> 430 bottles bug). Leave it untracked with a clear reason.
+            untracked.push({ name: ing.itemDisplay, reason: containerSize ? "unit mismatch" : `set ${pUnitRaw} size in pantry to track`, qty: need, unit: ing.unit });
+          }
+        } else if (sameFamily || sameContainerUnit || bothPlainCount) {
           const rFactor = sameFamily ? nUnitInfo(ing.unit).factor : 1;
-          const pFactor = sameFamily ? nUnitInfo(pItem.unit).factor : (PLAIN_COUNT_LABELS.has((pItem.unit||"").toLowerCase().trim()) ? 1 : nUnitInfo(pItem.unit).factor);
+          const pFactor = sameFamily ? nUnitInfo(pItem.unit).factor : (PLAIN_COUNT_LABELS.has(pUnitRaw) ? 1 : nUnitInfo(pItem.unit).factor);
           const needBase = need * rFactor;
           const haveBase = pItem.qty * pFactor;
           const deduct = round1(needBase / pFactor);
@@ -3693,6 +3724,22 @@ function PantryTab({ pantry, setPantry, spices, setSpices }) {
                       ))}
                     </div>
                   </div>
+                  {CONTAINER_UNITS.has((item.unit || "").toLowerCase().trim()) && (
+                    <div style={{ flexBasis:"100%", padding:"8px 10px", background:`${COLORS.boost}10`, border:`1px solid ${COLORS.boost}40`, borderRadius:7 }}>
+                      <div style={{ fontSize:11, fontWeight:600, color:COLORS.boost, marginBottom:4 }}>What's in one {(item.unit || "").toLowerCase().trim()}?</div>
+                      <div style={{ fontSize:10, color:COLORS.textSec, marginBottom:6, lineHeight:1.4 }}>
+                        Set this so recipes measured by weight/volume can deduct from this {(item.unit || "").toLowerCase().trim()}. Without it, those recipes won't auto-track against this item.
+                      </div>
+                      <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+                        <span style={{ fontSize:12, color:COLORS.text }}>1 {(item.unit || "").toLowerCase().trim()} =</span>
+                        <NumberInput value={item.containerSize?.amount ?? ""} onCommit={v => updateItem(item.id, { containerSize: v > 0 ? { amount: v, unit: item.containerSize?.unit || "ml" } : undefined })} min={0} fallback={0} style={{ width:64, padding:"6px 8px", borderRadius:5, border:`1.5px solid ${COLORS.boost}55`, fontSize:13, textAlign:"center" }} />
+                        <div style={{ minWidth:110 }}>
+                          <PickList value={item.containerSize?.unit || "ml"} onChange={u => updateItem(item.id, { containerSize: { amount: item.containerSize?.amount || 0, unit: u } })}
+                            options={[{ group:"Volume", items:[{value:"ml",label:"ml"},{value:"l",label:"l"},{value:"cup",label:"cups"},{value:"tbsp",label:"tbsp"}] }, { group:"Weight", items:[{value:"g",label:"g"},{value:"kg",label:"kg"},{value:"oz",label:"oz"},{value:"lb",label:"lb"}] }]} />
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   <div style={{ minWidth:140 }}>
                     <div style={{ fontSize:10, fontWeight:600, color:COLORS.textSec, marginBottom:2 }}>Store(s)</div>
                     <Combobox multi options={allStores} selected={itemStores(item)} onChange={v => updateItem(item.id, { stores: v, store: undefined })} placeholder="store(s)" />
