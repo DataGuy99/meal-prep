@@ -3232,12 +3232,29 @@ function ShopTab({ plan, recipes, setRecipes, pantry, setPantry, spices, setSpic
   })();
   const excludes = settings?.excludes || [];
   const maxOmissions = settings?.maxOmissions ?? Infinity;
-  const [shopItems, setShopItemsRaw] = useState(() => load("shopItems", []));
+  // One-time: the parse-once rebuild changed how shopping lines are produced.
+  // A list saved by the OLD code (no _v stamp) shows stale split entries (e.g.
+  // 3 beef lines) until manually refreshed. Detect that and drop it so the list
+  // starts clean — the user taps Refresh (or a generated list re-stamps it).
+  const SHOP_SCHEMA_V = 2;
+  const [shopItems, setShopItemsRaw] = useState(() => {
+    const saved = load("shopItems", []);
+    const stamped = load("shopItemsV", 0);
+    if (saved.length > 0 && stamped < SHOP_SCHEMA_V) {
+      // Keep only manual adds (user-entered, still valid); drop stale generated.
+      const manual = saved.filter(i => i.source === "manual");
+      save("shopItems", manual);
+      save("shopItemsV", SHOP_SCHEMA_V);
+      return manual;
+    }
+    return saved;
+  });
   // Persist the shopping list so leaving and returning keeps it — including
   // checked-off items the user already bought.
   const setShopItems = (v) => setShopItemsRaw(prev => {
     const next = typeof v === "function" ? v(prev) : v;
     save("shopItems", next);
+    save("shopItemsV", SHOP_SCHEMA_V);
     return next;
   });
   const [groupBy, setGroupBy] = useState("category");
@@ -3357,10 +3374,16 @@ function ShopTab({ plan, recipes, setRecipes, pantry, setPantry, spices, setSpic
             existing.qty = round1(existing.qty + qtyNum);
           }
         } else {
+          // Guess storage from the item's category instead of always "dry":
+          // frozen->frozen; perishables (dairy/meat/seafood/produce)->cold; else dry.
+          const cat = item.category || guessCategory(item.name);
+          const storage = cat === "Frozen" ? "frozen"
+            : (cat === "Dairy" || cat === "Meat" || cat === "Seafood" || cat === "Produce") ? "cold"
+            : "dry";
           next.push({
             id: uid(), name: normalize(item.name),
             qty: qtyNum || 1, unit: item.unit || "pcs", floor: 0,
-            storage: "dry", stores: item.store ? item.store.split(", ").filter(Boolean) : [],
+            storage, stores: item.store ? item.store.split(", ").filter(Boolean) : [],
           });
         }
       }
