@@ -1080,14 +1080,16 @@ function generateShoppingList(plan, recipes, pantry, excludes = [], activePerson
         if (!ing) continue;                       // header / empty
         if (ing.neverBuy) continue;               // water etc.
         if (omittedSet.has(normalize(rawIng.name || ing.item))) continue;
-        const key = ing.item;
+        const key = ing.mergeKey || ing.item;
         if (!needs[key]) {
           needs[key] = {
-            item: key, display: ing.itemDisplay || key, category: ing.category,
+            item: ing.item, display: ing.itemDisplay || ing.item, category: ing.category,
             soldAs: ing.soldAs, families: {}, parts: [], ambiguous: ing.ambiguousUnit,
+            form: ing.form || "", notes: new Set(),
           };
         }
-        const dbk = ITEM_DB[key];
+        if (ing.note) ing.note.split(",").forEach(s => { const t = s.trim(); if (t) needs[key].notes.add(t); });
+        const dbk = ITEM_DB[ing.item];
         // A bare count (no unit) on a WEIGHT-sold item is almost always a "to
         // taste" / "a pinch" artifact (recipe wrote "salt" with qty 1). Don't let
         // it become a phantom "xN" line. Flag the item as needed; if any real
@@ -1128,13 +1130,13 @@ function generateShoppingList(plan, recipes, pantry, excludes = [], activePerson
   for (const [key, need] of Object.entries(needs)) {
     const pantryItem = pantry.find(p => {
       const pn = normalizeIngredient(p);
-      return pn && pn.item === key;
+      return pn && pn.item === need.item;
     });
 
     // Decide the unit to express this item in. Count-sold items try to show whole
     // counts; weight-sold items show mass/volume. We compute a single combined
     // amount by converting each family to the display family where possible.
-    const db = ITEM_DB[key];
+    const db = ITEM_DB[need.item];
     const families = need.families;
     const famNames = Object.keys(families);
 
@@ -1217,6 +1219,7 @@ function generateShoppingList(plan, recipes, pantry, excludes = [], activePerson
       source: "plan",
       haveNote: haveNote || "",
       formNote: formNote || "",
+      note: need.notes && need.notes.size ? [...need.notes].slice(0, 4).join(", ") : "",
       ambiguous: need.ambiguous || false,
       composition: composition.length > 1 ? composition : [],
     };
@@ -3495,6 +3498,7 @@ function ShopTab({ plan, recipes, setRecipes, pantry, setPantry, spices, setSpic
                       <div style={{ flex:1, minWidth:0 }}>
                         <span style={{ fontSize:14, color:(item.checked&&!mergeMode)?COLORS.textSec:COLORS.text, textDecoration:(item.checked&&!mergeMode)?"line-through":"none" }}>{item.name}</span>
                         {item.formNote && !mergeMode && <span style={{ fontSize:11, color:COLORS.textSec, fontStyle:"italic" }}> · {item.formNote}</span>}
+                        {item.note && !mergeMode && <span style={{ fontSize:10.5, color:COLORS.textSec }}> ({item.note})</span>}
                         {item.reason && !mergeMode && <div style={{ fontSize:9, color:COLORS.red }}>{item.reason}</div>}
                       </div>
                       <div style={{ textAlign:"right", flexShrink:0 }}>

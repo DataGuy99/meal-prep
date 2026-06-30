@@ -150,7 +150,7 @@ function singularize(w) {
 }
 
 const PREP_DESCRIPTORS = ["julienned","julienne","minced","chopped","finely chopped","roughly chopped","diced","finely diced","sliced","thinly sliced","grated","shredded","crushed","ground","peeled","deseeded","seeded","cored","trimmed","halved","quartered","cubed","mashed","beaten","whisked","melted","softened","room temperature","chilled","cold","warm","hot","lukewarm","fresh","freshly","dried","frozen","thawed","cooked","uncooked","raw","divided","plus more","plus extra","for frying","for drizzling","for serving","for brushing","for greasing","for dusting","rinsed","drained","washed","patted dry","at room temperature","lightly packed","packed","level","heaped","heaping","sifted","toasted","roasted","store bought","store-bought","homemade","large","medium","small","extra large"];
-const MERGE_NOISE = ["to taste","for taste","or to taste","or more to taste","a pinch of","a pinch","pinch of","pinch","a dash of","a dash","dash of","dash","a sprinkle of","a sprinkle","sprinkle of","sprinkle","for garnish","to garnish","as garnish","garnish","as needed","if needed","optional","or as needed","a little","some","a bit of","a handful of","handful of","a few","a few sprinkle","few"];
+const MERGE_NOISE = ["to taste","for taste","or to taste","or more to taste","a pinch of","a pinch","pinch of","pinch","a dash of","a dash","dash of","dash","a sprinkle of","a sprinkle","sprinkle of","sprinkles","sprinkle","a shake of","shakes","shake","a few shakes","few shakes","for garnish","to garnish","as garnish","garnish","as needed","if needed","optional","or as needed","a little","little","some","a bit of","bit of","a handful of","handful of","a few sprinkles","a few sprinkle","a few","few","whole","several","couple of","a couple"];
 
 // Canonical-base rewrites (the curated "genuine same item" folds).
 const CANONICAL_BASE = [
@@ -167,6 +167,7 @@ const CANONICAL_BASE = [
   [/^(minced|crushed|grated|chopped|sliced|whole|peeled)?\s*garlic( clove(s)?)?( minced| crushed| grated| chopped)?$/, "garlic"],
   [/^(yellow|white|red|brown|spanish|sweet)?\s*onion$/, "onion"],
   [/^(freshly ground|ground|cracked|whole)?\s*black pepper$/, "black pepper"],
+  [/^(black |white )?peppercorns?$/, "black pepper"],
   [/^(all purpose|plain|cake|bread|self raising|self-raising)?\s*flour$/, "flour"],
   [/^(cold|hot|warm|lukewarm|boiling|ice|iced|filtered|room temperature)?\s*water$/, "water"],
   [/^(unsalted|salted|softened|melted)?\s*butter$/, "butter"],
@@ -213,31 +214,80 @@ export function isSectionHeader(raw) {
 
 // Reduce a raw ingredient name to its canonical item identity + a display label.
 // Returns { item, itemDisplay }.
+// Form qualifiers that make a GENUINELY different product (you buy them
+// separately): ground pepper vs whole peppercorns, powder vs paste. These stay
+// part of the item identity (merge key) so they don't wrongly collapse. Anything
+// NOT in this list (sprinkle, a few, freshly, chopped, cracked...) is just a note.
+const FORM_QUALIFIERS = ["ground", "whole", "powder", "powdered", "paste"];
+
 export function canonicalize(rawName) {
   const display0 = normalize(rawName);
   let n = display0;
-  if (!n) return { item: n, itemDisplay: n };
+  if (!n) return { item: n, itemDisplay: n, form: "", note: "" };
   n = n.replace(/^\s*[\d.\/]+\s*(?:g|kg|oz|lb|lbs?|ml|l|cups?|tbsp|tsp|cloves?|stalks?|slices?|pieces?|pcs?|cans?|bottles?|bags?|bunch(?:es)?|heads?|blocks?|fillets?|dozen|doz|pairs?)?\s+/i, "").trim();
+
+  // Capture everything we strip, to surface as a note on the entry. The note is
+  // the original descriptive text the user wrote, minus the bare ingredient.
+  const noteBits = [];
+  const paren = n.match(/\(([^)]*)\)/g);
+  if (paren) noteBits.push(...paren.map(p => p.replace(/[()]/g, "").trim()));
   n = n.replace(/\([^)]*\)/g, " ");
+  const forThe = n.match(/\bfor the [a-z ]+$/i);
+  if (forThe) noteBits.push(forThe[0].trim());
   n = n.replace(/\bfor the [a-z ]+$/i, " ");
+  const afterComma = n.match(/,\s*(.+)$/);
+  if (afterComma && afterComma[1].trim()) noteBits.push(afterComma[1].trim());
   n = n.replace(/,.*$/, " ");
   n = n.replace(/\b(homemade|store bought|store-bought|brand)\b/gi, " ");
-  for (const d of PREP_DESCRIPTORS) n = n.replace(new RegExp(`(^|[,\\s])${d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([,\\s]|$)`, "gi"), " ");
-  for (const noise of MERGE_NOISE) n = n.replace(new RegExp(`(^|[,\\s])${noise.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([,\\s]|$)`, "gi"), " ");
+
+  // Detect a FORM qualifier — but ONLY keep it as a distinguishing form for items
+  // where it's a REAL separate purchase (whole peppercorns vs ground pepper). For
+  // most things "ground"/"powder" is part of the name (baking powder, garlic
+  // powder) or irrelevant for shopping (ground beef is still beef), so we DON'T
+  // split those — at most we keep the word as a note. Over-splitting here is the
+  // "too aggressive" failure in reverse, so the allow-list is deliberately tiny.
+  let form = "";
+  const FORM_SPLIT_ITEMS = /\b(pepper|peppercorn)\b/i;
+  // Compounds where the "form" word is part of the ingredient name — never strip.
+  const FORM_COMPOUND = /\b(baking powder|baking soda|powdered sugar|curry powder|chili powder|garlic powder|onion powder|cocoa powder|protein powder|custard powder|tomato paste|curry paste|chili paste|miso paste|sesame paste|fish paste|shrimp paste|tahini paste|almond paste|tomato powder)\b/i;
+  if (!FORM_COMPOUND.test(n)) {
+    for (const f of FORM_QUALIFIERS) {
+      const re = new RegExp(`(^|\\s)${f}(\\s|$)`, "i");
+      if (re.test(n)) {
+        const remainder = n.replace(re, " ").replace(/\s+/g, " ").trim();
+        // Don't strip if it would leave a meaningless stub ("baking", "").
+        if (remainder.length < 3) { break; }
+        if ((f === "whole" || f === "ground") && FORM_SPLIT_ITEMS.test(remainder)) {
+          form = f.toLowerCase(); n = remainder;
+        } else {
+          noteBits.push(f); n = remainder;
+        }
+        break;
+      }
+    }
+  }
+
+  // Strip prep descriptors + merge-noise words — but record them as notes.
+  for (const d of PREP_DESCRIPTORS) {
+    const re = new RegExp(`(^|[,\\s])${d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([,\\s]|$)`, "gi");
+    if (re.test(n)) { noteBits.push(d); n = n.replace(re, " "); }
+  }
+  for (const noise of MERGE_NOISE) {
+    const re = new RegExp(`(^|[,\\s])${noise.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([,\\s]|$)`, "gi");
+    if (re.test(n)) { noteBits.push(noise); n = n.replace(re, " "); }
+  }
   n = n.replace(/[,]+/g, " ").replace(/\s+/g, " ").trim();
   n = n.split(" ").map(w => normalize(w)).filter(Boolean).join(" ");
-  // If stripping left nothing usable (e.g. name was just "cloves (optional)" and
-  // both the noun and the parenthetical got removed), fall back to the cleaned
-  // pre-canonical display rather than emitting leftover junk like "(optional)".
   if (!n || /^\(?optional\)?$/.test(n) || /^[^a-z]*$/.test(n)) {
     const fallback = display0.replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").trim();
     n = fallback || display0;
   }
   let item = n || display0;
   for (const [re, to] of CANONICAL_BASE) { if (re.test(item)) { item = item.replace(re, to).replace(/\s+/g, " ").trim(); break; } }
-  // Display label: the cleaned-but-uncanonicalized name (nicer), falling back to item.
   const itemDisplay = (n && n !== item) ? n : item;
-  return { item, itemDisplay };
+  // De-dupe + tidy the note text.
+  const note = [...new Set(noteBits.map(s => s.trim().toLowerCase()).filter(s => s && s.length > 1))].join(", ");
+  return { item, itemDisplay, form, note };
 }
 
 export function isNeverBuy(name) {
@@ -311,7 +361,7 @@ export function normalizeIngredient(input, opts = {}) {
   // Strip leading measurement/size descriptors that aren't the item:
   // "2 inch cinnamon piece" -> "cinnamon piece", "whole cashew" -> "cashew".
   rest = rest.replace(/^\s*[\d.\/]*\s*(inch|inches|cm|mm)\s+/i, "");
-  rest = rest.replace(/^(whole|large|medium|small|extra large|fresh|dried|raw|ripe)\s+/i, "");
+  rest = rest.replace(/^(large|medium|small|extra large|fresh|dried|raw|ripe)\s+/i, "");
   // Strip trailing purpose clauses: "water to blend" -> "water", "oil for frying" -> "oil".
   rest = rest.replace(/\s+(to blend|to taste|to serve|to garnish|for blending|for frying|for serving|for garnish|for drizzling|for brushing|if required|as needed|or more)\b.*$/i, "");
 
@@ -331,7 +381,7 @@ export function normalizeIngredient(input, opts = {}) {
   const cleanedName = stripPrepClauseLocal(normalize(rest));
   if (!cleanedName) return null;
   if (isSectionHeader(cleanedName)) return null;
-  const { item, itemDisplay } = canonicalize(cleanedName);
+  const { item, itemDisplay, form, note } = canonicalize(cleanedName);
   if (!item) return null;
 
   // Family + base quantity.
@@ -385,8 +435,11 @@ export function normalizeIngredient(input, opts = {}) {
     unit,
     family,
     item,
-    itemDisplay,
+    itemDisplay: form ? `${form} ${itemDisplay}` : itemDisplay,
     name: item,                  // back-compat alias = canonical item (matching code reads ing.name)
+    form,                        // "ground"/"whole"/... — a real product distinction, or ""
+    note,                        // descriptive text the user wrote (sprinkle, a few, freshly...)
+    mergeKey: form ? `${item}|${form}` : item,  // shopping aggregates by this; keeps ground≠whole
     tier,
     confirmed: false,        // becomes true only via the entry-review step
     baseQty,
